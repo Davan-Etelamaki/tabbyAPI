@@ -506,29 +506,63 @@ def install():
         return orig(self, draft_length)   # stock session-local fallback
 
     _job.Job.get_ngram_draft = patched
-    # patch-21: store hook on the HYBRID lane (mtp boots). Job.get_hybrid_draft
-    # (job.py:1824) = suffix-match continuation with built-in lag periodicity;
-    # the store adds CROSS-SESSION chains. Read-only here (propose only, no
-    # ingest): write-path on mtp boots is a measured follow-up. Env gate
-    # GS_HYB (default off = byte-identical to pre-21 behavior). Miss/exception
-    # ALWAYS delegates to the original; target verification judges every token.
-    if os.environ.get("GS_HYB", "0") == "1" and hasattr(_job.Job, "get_hybrid_draft"):
+    # patch-24 (_GS_HYB_V21): hybrid-store v2.1. The 23:39 boot MEASURED two v2
+    # defects: (a) stats printed every 20 calls -> log flood at fleet call-rate;
+    # (b) first-call ingest ran an O(tail) python loop under the global lock on
+    # 10k+ prompts -> decode stalls -> timeouts. v2.1: ingest BOUNDED per call to
+    # GS_HYB_INGEST_CAP (default 512) tail tokens; propose ONLY on DRY steps (wet
+    # suffix match costs zero); shadow counts hyb_dry/hyb_dryhit = the replay-
+    # from-store evidence; printer time+change gated. Modes GS_HYB=0|shadow|1
+    # unchanged; stock suffix match still runs FIRST and wins unless overridden.
+    _HYBM = os.environ.get("GS_HYB", "0")
+    if _HYBM != "0" and hasattr(_job.Job, "get_hybrid_draft"):
         _hyb_orig = _job.Job.get_hybrid_draft
         _HYB_MIN = int(os.environ.get("GS_HYB_MIN", "4"))
+        _HYB_CAP = int(os.environ.get("GS_HYB_INGEST_CAP", "512"))
+        _HYB_SECS = float(os.environ.get("GS_HYB_STATS_SECS", "60"))
+        _hyb_last = [None, 0]
         def hyb_patched(self, length):
+            res = _hyb_orig(self, length)   # stock suffix match runs FIRST
             try:
-                t = self.sequences[0].sequence_ids.torch()
-                lo = max(0, t.shape[-1] - LADDER[0] + 1)
-                seq = t[lo:].tolist()
+                _calls["hyb_calls"] += 1
+                t = self.sequences[0].sequence_ids.torch()[0]
+                n = int(t.shape[0])
+                jid = id(self)
+                tail = min(n, _HYB_CAP)     # BOUNDED slice: never O(context)
+                base = n - tail
+                seq = t[base:].tolist()
+                if not hasattr(hyb_patched, "_spec"):
+                    spec = set()
+                    try:
+                        tt = getattr(self, "tokenizer", self)
+                        ids = getattr(tt, "all_special_ids", None)
+                        if ids:
+                            spec.update(int(x) for x in ids)
+                    except Exception:
+                        pass
+                    hyb_patched._spec = frozenset(spec)
+                spec = hyb_patched._spec
+                ml = res[1] if isinstance(res, tuple) and len(res) > 1 else 0
+                dry = ml < _HYB_MIN
                 with _lock:
-                    cand = propose(seq, length) if seq else None
-                _calls["hyb_try"] += 1
-                if cand and len(cand) >= _HYB_MIN:
-                    _calls["hyb_win"] += 1
-                    return torch.tensor([cand[:length]], dtype = torch.long), len(cand[:length])
+                    _ingest(seq, spec, jid = jid, base = base, n_total = n)
+                    if dry:
+                        _calls["hyb_dry"] += 1
+                        cand = propose(seq, length) if seq else None
+                        if cand and len(cand) >= _HYB_MIN:
+                            _calls["hyb_dryhit"] += 1
+                            if _HYBM != "shadow":
+                                _calls["hyb_win"] += 1
+                                res = (torch.tensor([cand[:length]], dtype = torch.long),
+                                       len(cand[:length]))
+                _tot = _calls["hyb_calls"]
+                if (_hyb_last[0] is None or time.monotonic() - _hyb_last[0] >= _HYB_SECS) \
+                        and _tot != _hyb_last[1]:
+                    _hyb_last[0] = time.monotonic(); _hyb_last[1] = _tot
+                    _ui("[GS] hybstats " + str(dict(_calls)))
             except Exception:
                 _calls["error"] += 1
-            return _hyb_orig(self, length)
+            return res
         _job.Job.get_hybrid_draft = hyb_patched
 
     _load()
@@ -556,18 +590,24 @@ def install():
     if DUMP_SECS > 0:
         threading.Thread(target=_dumper, daemon=True).start()
 
+    _WATCH_SECS = float(os.environ.get("GS_WATCH_SECS", "300"))
     def _watchdog():
-        # Activation assertion (lesson 2026-10-10: prod ran draft_mode=mtp for
-        # hours, which bypasses get_ngram_draft -> GS silently idle). Loud log
-        # if the hook path is dead after 120s of live traffic.
-        time.sleep(120)
-        if _calls["calls"] == 0:
-            _ui("[GS] WARNING: 0 calls in 120s — the ngram drafter is not "
-                  "being used (draft_mode is not 'ngram'). Global store is "
-                  "INERT. Set draft_mode: ngram (launcher does this when "
-                  "GS_ENABLE=1).")
-        else:
-            _ui(f"[GS] watchdog: {dict(_calls)}")
+        # v2.1 (owner 2026-10-13): the old check fired ONCE at import+120s and
+        # counted ONLY the ngram path. Prod boots and first big-prompt traffic
+        # land past 120s, so EVERY healthy MTP boot was branded "INERT" before
+        # the store could possibly have been touched - a false verdict that made
+        # the GS program look dead while it was never actually measured. Proved
+        # live 2026-10-13 23:42: INERT printed while the hybrid hook had served
+        # 9000+ calls. No timed verdict now: silent while every lane's counter
+        # is zero (idle boot is not inert), one live line per window in which
+        # EITHER lane (ngram calls or hyb_calls) moved.
+        _last = 0
+        while True:
+            time.sleep(_WATCH_SECS)
+            tot = _calls["calls"] + _calls.get("hyb_calls", 0)
+            if tot and tot != _last:
+                _last = tot
+                _ui("[GS] watchdog live: " + str(dict(_calls)))
     threading.Thread(target=_watchdog, daemon=True).start()
     _ui("[GS] v3 code loaded")
     _ui(f"[GS] global store installed (ladder {LADDER}, min_key {MIN_KEY}, "
