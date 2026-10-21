@@ -133,6 +133,7 @@ def _ingest(seq, spec=frozenset(), jid=None, base=0, n_total=None):
 
 ENTRY_CAP = int(os.environ.get("GS_ENTRY_CAP", "64"))  # patch-15: max distinct continuations per ladder key
 AGE_SECS = int(os.environ.get("GS_AGE_DAYS", "3")) * 86400  # patch-18-A: decay horizon
+_CONCAT = os.environ.get("GS_CONCAT", "0") == "1"  # patch-20: head-prefix + store-tail
 _GS_T0 = time.time()  # age reference when no store file exists yet
 EV = os.environ.get("GS_EV", "0") == "1"
 GATE_MIN = int(os.environ.get("GS_GATE", "2"))
@@ -584,6 +585,21 @@ def _mtp_union_install():
                 w = int(draft_tokens.shape[-1])
                 if w > 0:
                     _calls["m_try"] += 1
+                    if globals().get("_CONCAT", False):
+                        # patch-20 concat: MTP head PREFIX + store TAIL past w, to engine cap.
+                        # Engine-side tree verify keeps output correct; tail only must beat
+                        # its slot cost (~0.35 ms vs 17.8 ms step) - r90 pricing. globals()
+                        # lookup: bridge body is exec'd into test namespaces lacking the
+                        # module global; a bare name there = swallowed NameError = silent passthrough.
+                        _cap = max(w, int(getattr(self.generator, "max_draft_tokens", w)))
+                        _rf = self.get_ngram_draft(_cap)
+                        if _rf is not None and _rf.shape[-1] > w:
+                            import torch as _T
+                            dt = _T.cat([draft_tokens,
+                                         _rf[:, w:_cap].to(dtype=draft_tokens.dtype,
+                                                            device=draft_tokens.device)], dim=-1)
+                            _calls["c_join"] += 1
+                            return _orig_gil(self, dt, idx, add_to_cache)
                     row = self.get_ngram_draft(w)
                     if row is not None and row.shape[-1] >= w:
                         dt = row[:, :w].to(dtype=draft_tokens.dtype,
