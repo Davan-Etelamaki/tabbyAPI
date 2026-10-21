@@ -82,7 +82,7 @@ class BaseSamplerRequest(BaseModel):
         validation_alias=AliasChoices("max_tokens", "max_completion_tokens", "max_length"),
         description="Aliases: max_length",
         examples=[150],
-        ge=0,
+        ge=1,
     )
 
     min_tokens: Optional[int] = Field(
