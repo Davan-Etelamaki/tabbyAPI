@@ -213,6 +213,33 @@ class QwenToolCallDeltaStreamer:
                     self._consume_value(consume, self._cur)
                     break
 
+                state = qwen3_coder.boundary_state(
+                    self._buf[close + len(_PARAM_CLOSE) :],
+                    qwen3_coder._AFTER_PARAM_CLOSE,
+                    at_end=False,
+                )
+                if state == "unknown":
+                    # Only whitespace has arrived after the close tag, so whether
+                    # it ends this value is not decidable yet. Hold the tag and
+                    # let the next chunk decide; if the stream ends here the block
+                    # never releases and the release guard falls back to the
+                    # end-of-stream parse, so nothing partial reaches the client.
+                    consume = self._buf[:close]
+                    self._block_raw += consume
+                    self._consume_value(consume, self._cur)
+                    self._buf = self._buf[close:]
+                    break
+                if state == "literal":
+                    # Markup inside a value: this close tag is value content, not
+                    # a boundary. Streaming it is what keeps the fragments equal
+                    # to the end-of-stream parse for the shape that used to
+                    # truncate the argument.
+                    consume = self._buf[: close + len(_PARAM_CLOSE)]
+                    self._block_raw += consume
+                    self._consume_value(consume, self._cur)
+                    self._buf = self._buf[close + len(_PARAM_CLOSE) :]
+                    continue
+
                 self._block_raw += self._buf[:close] + _PARAM_CLOSE
                 self._consume_value(self._buf[:close], self._cur)
                 self._buf = self._buf[close + len(_PARAM_CLOSE) :]

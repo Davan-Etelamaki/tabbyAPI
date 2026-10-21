@@ -10,6 +10,7 @@ unit tests in this directory.
 """
 
 import asyncio
+import json
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -116,8 +117,16 @@ class StreamingDeltaWiringTests(unittest.IsolatedAsyncioTestCase):
 
         frames, _ = await run_collector(mc, make_request())
 
+        # The release-on-close guard (SECON-458) flushes a block's fragments only
+        # when that block's raw text re-parses byte-identically, so ONE call
+        # arrives as one frame carrying several fragments. Asserting more frames
+        # here would assert a contract the guard deliberately removed; what must
+        # hold is that fragments were produced and reassemble exactly (below).
         tool_frames = [f for f in frames if f.get("delta_tool_calls")]
-        self.assertGreaterEqual(len(tool_frames), 2, "expected multiple delta frames")
+        self.assertEqual(len(tool_frames), 1, "one released block, one frame")
+        deltas = tool_frames[0]["delta_tool_calls"]
+        self.assertEqual(len(deltas), 1, "consecutive fragments merge per index")
+        self.assertEqual(deltas[0]["function"]["name"], "get_weather")
 
         # reasoning arrives before any tool fragment
         first_reasoning = next(i for i, f in enumerate(frames) if f.get("delta_reasoning_content"))
@@ -209,3 +218,101 @@ class StreamingDeltaWiringTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PayloadIntegrityTests(unittest.IsolatedAsyncioTestCase):
+    """What the client actually receives when an argument quotes the wire format.
+
+    The census shapes (research/litellm-tool-call-integrity F1): prose continuing
+    after a literal parameter close tag, and an argument carrying a whole call of
+    this same format. Both used to cost the caller the rest of the value and every
+    later argument, with finish_reason=tool_calls reported as a success.
+    """
+
+    @staticmethod
+    def _request(name, props):
+        return make_request(
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "parameters": {"type": "object", "properties": props},
+                    },
+                }
+            ],
+            messages=[ChatCompletionMessage(role="user", content="go")],
+        )
+
+    async def test_markup_close_in_value_keeps_the_tail_and_the_next_argument(self):
+        # the shape a coding agent emits when the text it writes continues after
+        # a quoted parameter close tag
+        value = "def f():" + LT + "/parameter" + GT + " and the tail"
+        text = (
+            TC_S
+            + LT + "function=write_file" + GT
+            + LT + "parameter=content" + GT + "\n" + value + LT + "/parameter" + GT
+            + LT + "parameter=purpose" + GT + "\nwhy it matters" + LT + "/parameter" + GT
+            + LT + "/function" + GT
+            + TC_E
+        )
+        request = self._request("write_file", {"content": {"type": "string"},
+                                               "purpose": {"type": "string"}})
+
+        _, result = await run_collector(make_mc(pieces(text)), request, streaming=False)
+
+        args = json.loads(result["tool_calls"][0]["function"]["arguments"])
+        self.assertIn("and the tail", args["content"], "value tail survived")
+        self.assertEqual(args["purpose"], "why it matters", "later argument survived")
+
+    async def test_echoed_call_stays_one_call_with_its_second_argument(self):
+        inner = (
+            LT + "function=write_file" + GT
+            + LT + "parameter=content" + GT + "\nx.py" + LT + "/parameter" + GT
+            + LT + "/function" + GT
+        )
+        text = (
+            TC_S
+            + LT + "function=bash" + GT
+            + LT + "parameter=command" + GT + "\n" + inner + " suffix" + LT + "/parameter" + GT
+            + LT + "parameter=description" + GT + "\nrun it" + LT + "/parameter" + GT
+            + LT + "/function" + GT
+            + TC_E
+        )
+        request = self._request("bash", {"command": {"type": "string"},
+                                         "description": {"type": "string"}})
+
+        _, result = await run_collector(make_mc(pieces(text)), request, streaming=False)
+
+        calls = result["tool_calls"]
+        self.assertEqual(len(calls), 1, "quoted markup is not a second call")
+        self.assertEqual(calls[0]["function"]["name"], "bash")
+        args = json.loads(calls[0]["function"]["arguments"])
+        self.assertIn("suffix", args["command"], "value tail survived")
+        self.assertEqual(args["description"], "run it", "later argument survived")
+
+    async def test_streamed_fragments_equal_the_parse_for_markup_values(self):
+        # the delta streamer must apply the same reading, or the release guard
+        # suppresses streaming for every request of this shape
+        value = "def f():" + LT + "/parameter" + GT + " and the tail"
+        text = (
+            TC_S
+            + LT + "function=write_file" + GT
+            + LT + "parameter=content" + GT + "\n" + value + LT + "/parameter" + GT
+            + LT + "parameter=purpose" + GT + "\nwhy it matters" + LT + "/parameter" + GT
+            + LT + "/function" + GT
+            + TC_E
+        )
+        request = self._request("write_file", {"content": {"type": "string"},
+                                               "purpose": {"type": "string"}})
+
+        frames, _ = await run_collector(make_mc(pieces(text)), request)
+
+        tool_frames = [f for f in frames if f.get("delta_tool_calls")]
+        self.assertGreaterEqual(len(tool_frames), 1)
+        assembled = ""
+        for frame in tool_frames:
+            for delta in frame["delta_tool_calls"]:
+                assembled += delta["function"].get("arguments", "")
+        authoritative = qwen3_coder.parse_toolcalls(text)[0].function.arguments
+        self.assertEqual(assembled, authoritative, "fragments must equal the EOS parse")
