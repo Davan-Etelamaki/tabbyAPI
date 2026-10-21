@@ -112,9 +112,18 @@ def _ingest(seq, spec=frozenset(), jid=None, base=0, n_total=None):
             d = _lad[L]
             if k not in d and len(d) >= MAX_KEYS:
                 continue
-            d.setdefault(k, Counter())[cont] += 1
+            e = d.setdefault(k, Counter())
+            e[cont] += 1
+            if len(e) > ENTRY_CAP * 2:
+                # patch-15 WEAK-SPOT FENCE (bench 2026-10-11): hot keys grew
+                # unbounded fanout; tree_spine walks entry.items() on every
+                # hit (GS_MODE=tree prod) - measured 2.8 ms @1024 and rising
+                # with uptime. Prune at 2x cap to top-ENTRY_CAP by count:
+                # spine hard-bounds (~176 us @64); ev_chain uses top-8 (safe).
+                d[k] = Counter(e.most_common(ENTRY_CAP))
     _wm[jid] = n
 
+ENTRY_CAP = int(os.environ.get("GS_ENTRY_CAP", "64"))  # patch-15: max distinct continuations per ladder key
 EV = os.environ.get("GS_EV", "0") == "1"
 GATE_MIN = int(os.environ.get("GS_GATE", "2"))
 
@@ -153,8 +162,11 @@ def _tree_spine(entry, draft_length):
         for d in range(1, min(len(cont), draft_length) + 1):
             p = cont[:d]
             nodes[p] = nodes.get(p, 0) + cnt
+    # patch-15b: str(p) tie-break — raw-key compare could mix int/tuple on
+    # pruned-Counter paths (fence test caught it 2026-10-11 13:31); string
+    # compare is total, deterministic, and keeps shorter-prefix priority.
     scored = sorted(nodes, key=lambda p: (-(math.log(nodes[p]) + beta * len(p)),
-                                          len(p), p))
+                                          len(p), str(p)))
     top = set(scored[:B])
     spine = []
     for d in range(1, draft_length + 1):
