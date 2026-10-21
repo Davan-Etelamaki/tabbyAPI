@@ -247,3 +247,7 @@ async def embeddings(request: Request, data: EmbeddingsRequest) -> EmbeddingsRes
     )
 
     return response
+
+# p47: Anthropic Messages + OpenAI Responses dialects (text-only v1)
+from endpoints.OAI import compat  # noqa: E402
+router.include_router(compat.router)
