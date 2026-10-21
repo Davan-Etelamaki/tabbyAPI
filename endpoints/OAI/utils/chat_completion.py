@@ -46,7 +46,9 @@ from endpoints.OAI.utils.stream_parser import (
 from endpoints.OAI.utils.tools import (
     get_toolcall_tags,
     parse_toolcalls,
+    supports_delta_streaming,
 )
+from endpoints.OAI.utils.toolcall_stream import QwenToolCallDeltaStreamer
 from endpoints.OAI.utils.common_ import aggregate_usage_stats, get_timings, get_usage_stats
 
 
@@ -144,11 +146,18 @@ def _compose_response(
 
     choices = []
     for generation in generations:
+        tool_calls = generation.get("tool_calls") or None
+        content = generation.get("content")
+        # tabbyAPI-02: `or None` re-collapsed the empty string the collector
+        # returns back into null; both sites must agree (content stays "").
+        if content is None and tool_calls is None:
+            content = ""
+
         message = ChatCompletionMessage(
             role="assistant",
-            content=generation.get("content") or None,
+            content=content,
             reasoning_content=generation.get("reasoning_content") or None,
-            tool_calls=generation.get("tool_calls") or None,
+            tool_calls=tool_calls,
         )
 
         choices.append(
