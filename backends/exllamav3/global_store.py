@@ -123,6 +123,13 @@ def _ingest(seq, spec=frozenset(), jid=None, base=0, n_total=None):
                 # spine hard-bounds (~176 us @64); ev_chain uses top-8 (safe).
                 d[k] = Counter(e.most_common(ENTRY_CAP))
     _wm[jid] = n
+    if len(_wm) > 10_000:
+        # patch-17 (register T4: bound unbounded space): watermarks key per
+        # job and jobs END - today's audit found init-only, zero eviction
+        # (~14 MB/day class). Prune oldest half by insertion order; a re-
+        # appearing old job re-ingests harmlessly (counts are statistical).
+        for _wj in list(_wm)[:5_000]:
+            _wm.pop(_wj, None)
 
 ENTRY_CAP = int(os.environ.get("GS_ENTRY_CAP", "64"))  # patch-15: max distinct continuations per ladder key
 EV = os.environ.get("GS_EV", "0") == "1"
