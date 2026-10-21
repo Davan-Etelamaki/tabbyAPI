@@ -929,7 +929,7 @@ class ExllamaV3Container:
         draft_tokens = unwrap(self.draft_num_tokens, default_draft_tokens)
         batch_draft_args = {
             "max_batch_size": self.max_batch_size,
-            "max_history": max(draft_tokens, self.hybrid_draft_tokens),
+            "max_history": max(draft_tokens, self.hybrid_draft_tokens, self.replay_max_tokens),
             "recurrent_dtype": torch.float if self.recurrent_state_fp32 else torch.half,
         }
 
