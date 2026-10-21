@@ -1903,6 +1903,15 @@ class ExllamaV3Container:
             if not job.cancelled:
                 await job.cancel()
 
+    def note_incoming_request(self) -> None:
+        # p25 admission hint (see exllamav3 generator.iterate). 16 hinted rounds at one page
+        # each ~ a ~1.5 s fast window - enough for a new request handler (several event-loop
+        # passes) to finish tokenizing and enqueue while a long prefill is in flight.
+        gen = getattr(self.generator, "generator", None)
+        if gen is not None and len(getattr(self.generator, "jobs", {})) > 0:
+            # only hint when the engine already has work; an idle engine admits instantly
+            gen.admission_hint = min(getattr(gen, "admission_hint", 0) + 16, 32)
+
     async def generate_gen(
         self,
         request_id: str,

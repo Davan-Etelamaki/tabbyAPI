@@ -120,6 +120,12 @@ async def chat_completion_request(
     If stream = true, this returns an SSE stream.
     """
 
+    # p25: hint the engine a request is arriving so in-flight prefill rounds shrink briefly
+    # and this handler can reach enqueue between chunks instead of after the whole prefill.
+    note = getattr(model.container, "note_incoming_request", None)
+    if note is not None:
+        note()
+
     raw_json = await request.json()
     xlogger.debug("[ENDPOINT] /v1/chat/completions", {"raw": raw_json})
 
