@@ -72,7 +72,7 @@ class ReasoningOptions(BaseModel):
 
     effort: Optional[str] = None
     enabled: Optional[bool] = None
-    max_tokens: Optional[int] = None
+    max_tokens: Optional[int] = Field(default=None, ge=1)
 
 
 # Inherited from common request
