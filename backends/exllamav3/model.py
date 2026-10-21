@@ -200,6 +200,9 @@ def _describe_reasoning_settings(reasoning_params: BaseSamplerRequest) -> str:
     return ", ".join(parts)
 
 
+from . import global_store as _gs
+_gs.install()
+
 class ExllamaV3Container:
     """Model container for the ExLlamaV3 backend."""
 
