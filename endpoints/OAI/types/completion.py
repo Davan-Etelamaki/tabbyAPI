@@ -57,9 +57,10 @@ class CompletionRespChoice(BaseModel):
 class CompletionRequest(CommonCompletionRequest):
     """Represents a completion request."""
 
-    # Prompt can also contain token ids, but that's out of scope
-    # for this project.
-    prompt: Union[str, List[str]]
+    # p29-follow (tabbyAPI-06): a List[int] prompt is passed through as exact
+    # token ids (llama.cpp-compatible). A List[str] stays a batch of prompts;
+    # a single token-id prompt is detected by its int elements.
+    prompt: Union[str, List[str], List[int]]
 
 
 class CompletionResponse(BaseModel):

@@ -285,7 +285,7 @@ async def stream_generate_completion(
     Generator for the generation process.
     """
 
-    if isinstance(prompts, str):
+    if isinstance(prompts, str) or (isinstance(prompts, list) and prompts and isinstance(prompts[0], int)):
         prompts = [prompts]
 
     gen_queue = asyncio.Queue()
@@ -412,7 +412,7 @@ async def generate_completion(
     gen_tasks: List[asyncio.Task] = []
     return_usage = True  # non-streaming responses always carry usage
 
-    if isinstance(prompts, str):
+    if isinstance(prompts, str) or (isinstance(prompts, list) and prompts and isinstance(prompts[0], int)):
         prompts = [prompts]
 
     try:

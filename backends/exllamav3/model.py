@@ -1991,7 +1991,9 @@ class ExllamaV3Container:
         stop_conditions = list(set(stop_conditions))
 
         input_ids = [
-            self.encode_prompt(
+            torch.tensor([prompt], dtype=torch.long)
+            if isinstance(prompt, (list, tuple)) and len(prompt) > 0 and isinstance(prompt[0], int)
+            else self.encode_prompt(
                 prompt,
                 add_bos=add_bos_token,
                 encode_special_tokens=True,
