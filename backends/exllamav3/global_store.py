@@ -132,6 +132,8 @@ def _ingest(seq, spec=frozenset(), jid=None, base=0, n_total=None):
             _wm.pop(_wj, None)
 
 ENTRY_CAP = int(os.environ.get("GS_ENTRY_CAP", "64"))  # patch-15: max distinct continuations per ladder key
+AGE_SECS = int(os.environ.get("GS_AGE_DAYS", "3")) * 86400  # patch-18-A: decay horizon
+_GS_T0 = time.time()  # age reference when no store file exists yet
 EV = os.environ.get("GS_EV", "0") == "1"
 GATE_MIN = int(os.environ.get("GS_GATE", "2"))
 
@@ -307,7 +309,12 @@ def _dump():
         fp = (tuple(sorted(_calls.items())),
               tuple(sorted((L, len(_lad[L])) for L in _lad)))
         global _LAST_DUMP_FP
-        if _LAST_DUMP_FP == fp and os.path.exists(STORE_PATH):
+        try:  # content age IS file age; no fresh-boot amnesty for stale files
+            _ref = os.path.getmtime(STORE_PATH)
+        except OSError:
+            _ref = _GS_T0
+        _stale = AGE_SECS > 0 and (time.time() - _ref) > AGE_SECS
+        if _LAST_DUMP_FP == fp and os.path.exists(STORE_PATH) and not _stale:
             return
         snap = {"lad": {}}
         BATCH = 5000
@@ -330,6 +337,26 @@ def _dump():
         # heartbeat gap at 2x the store size; the GIL is released on GPU waits,
         # so decode keeps running. The old wedge was holding _lock across the
         # whole-store copy, which this batched loop already removed.
+        if _stale:
+            # patch-18-A count-aging: snapshot-only decay (live store pays zero
+            # during the session; decay lands at restart when the halved file
+            # loads back). Singleton drop-out (1//2 -> 0) IS the forgetting.
+            # Emits its own line: a fallback that stays silent is a bug twin
+            # (law: explicit fallback metrics).
+            _n = 0
+            for _lvl in snap["lad"].values():
+                for _k in list(_lvl):
+                    _c = _lvl[_k]
+                    for _tok in list(_c):
+                        if _c[_tok] >= 2:
+                            _c[_tok] //= 2
+                        else:
+                            del _c[_tok]
+                            _n += 1
+                    if not _c:
+                        del _lvl[_k]
+            print("[GS] count-aging: store older than %dd, counts halved, "
+                  "%d singletons dropped" % (AGE_SECS // 86400, _n))
         with open(tmp, "wb") as fh:
             pickle.dump(snap, fh, protocol=4)
         os.replace(tmp, STORE_PATH)
