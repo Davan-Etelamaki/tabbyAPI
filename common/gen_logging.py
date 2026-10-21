@@ -172,6 +172,13 @@ def log_metrics(
         total_draft = accept + reject
         accept_rate = accept / total_draft * 100 if total_draft > 0 else 0.0
         sections.append(f"draft {accept}/{total_draft} accepted ({accept_rate:.0f}%)")
+        dd = metrics.get("draft_depth")
+        if dd and dd.get("s"):
+            sections.append(
+                "depth[s={},p={},a={}]".format(
+                    dd["s"], ",".join(map(str, dd["p"])), ",".join(map(str, dd["a"]))
+                )
+            )
 
     finish = _describe_finish(metrics)
     if finish:
