@@ -10,7 +10,8 @@ from typing import List, Literal, Optional, Union
 
 
 CACHE_SIZES = Literal["FP16", "Q8", "Q6", "Q4"]
-CACHE_TYPE = Union[CACHE_SIZES, constr(pattern=r"^[2-8]\s*,\s*[2-8]$")]
+# NVFP4/FP8 KV cache (fork exllamav3 CacheLayer_nvfp4/CacheLayer_fp8)
+CACHE_TYPE = Union[CACHE_SIZES, Literal["NVFP4", "FP8"], constr(pattern=r"^[2-8]\s*,\s*[2-8]$")]
 
 
 class Metadata(BaseModel):

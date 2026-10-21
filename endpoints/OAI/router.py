@@ -2,6 +2,7 @@ import asyncio
 from asyncio import CancelledError, InvalidStateError
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import BaseModel
 from sse_starlette import EventSourceResponse
 
 from common import model
@@ -173,6 +174,40 @@ async def chat_completion_request(
 
     except (CancelledError, InvalidStateError) as ex:
         raise HTTPException(422, "/v1/chat/completions request cancelled by user.") from ex
+
+
+# Tokenize / detokenize endpoints (llama.cpp-compatible shapes, also under /v1).
+# The jev toolchain calls /tokenize at the ROOT and reads tokens + count;
+# /detokenize callers read prompt. Measured 2026-10-04: absent (404) on the
+# running build, which fails the jev-medium repoint gate (BACKLOG item 29).
+
+class TokenizeRequest(BaseModel):
+    prompt: str
+    add_special: bool = False
+
+class TokenizeResponse(BaseModel):
+    tokens: list[int]
+    count: int
+
+class DetokenizeRequest(BaseModel):
+    tokens: list[int]
+
+class DetokenizeResponse(BaseModel):
+    prompt: str
+
+@router.post("/tokenize", dependencies=[Depends(check_api_key), Depends(check_model_container)])
+@router.post("/v1/tokenize", dependencies=[Depends(check_api_key), Depends(check_model_container)])
+async def tokenize_endpoint(data: TokenizeRequest) -> TokenizeResponse:
+    tokens = model.container.encode_tokens(
+        data.prompt, add_bos_token=data.add_special
+    ) or []
+    return TokenizeResponse(tokens=list(tokens), count=len(tokens))
+
+@router.post("/detokenize", dependencies=[Depends(check_api_key), Depends(check_model_container)])
+@router.post("/v1/detokenize", dependencies=[Depends(check_api_key), Depends(check_model_container)])
+async def detokenize_endpoint(data: DetokenizeRequest) -> DetokenizeResponse:
+    text = model.container.decode_tokens(list(data.tokens)) or ""
+    return DetokenizeResponse(prompt=text)
 
 
 # Apply template endpoint (llama-server compatible)
