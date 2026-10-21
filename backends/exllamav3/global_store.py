@@ -506,6 +506,30 @@ def install():
         return orig(self, draft_length)   # stock session-local fallback
 
     _job.Job.get_ngram_draft = patched
+    # patch-21: store hook on the HYBRID lane (mtp boots). Job.get_hybrid_draft
+    # (job.py:1824) = suffix-match continuation with built-in lag periodicity;
+    # the store adds CROSS-SESSION chains. Read-only here (propose only, no
+    # ingest): write-path on mtp boots is a measured follow-up. Env gate
+    # GS_HYB (default off = byte-identical to pre-21 behavior). Miss/exception
+    # ALWAYS delegates to the original; target verification judges every token.
+    if os.environ.get("GS_HYB", "0") == "1" and hasattr(_job.Job, "get_hybrid_draft"):
+        _hyb_orig = _job.Job.get_hybrid_draft
+        _HYB_MIN = int(os.environ.get("GS_HYB_MIN", "4"))
+        def hyb_patched(self, length):
+            try:
+                t = self.sequences[0].sequence_ids.torch()
+                lo = max(0, t.shape[-1] - LADDER[0] + 1)
+                seq = t[lo:].tolist()
+                with _lock:
+                    cand = propose(seq, length) if seq else None
+                _calls["hyb_try"] += 1
+                if cand and len(cand) >= _HYB_MIN:
+                    _calls["hyb_win"] += 1
+                    return torch.tensor([cand[:length]], dtype = torch.long), len(cand[:length])
+            except Exception:
+                _calls["error"] += 1
+            return _hyb_orig(self, length)
+        _job.Job.get_hybrid_draft = hyb_patched
 
     _load()
     atexit.register(_dump)
