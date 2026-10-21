@@ -413,8 +413,14 @@ class ExllamaV3Container:
         self.use_draft_model = draft_mode == "mtp" or (
             draft_mode == "model" and bool(draft_model_name)
         )
+        _ngm = draft_args.get("ngram_match_min")
+        # patch-19 hybrid-lane-unmute: an explicitly configured ngram_match_min is
+        # honored in EVERY draft mode (the native lane merges live-context with the
+        # corpus slot at job.py:1855-1873; the old ternary zeroed it on mtp boots,
+        # leaving no way to run store+ngram beside MTP). Unset keeps status quo:
+        # 2 on ngram mode, 0 elsewhere. Defaults stay safe (law-570).
         self.ngram_match_min = (
-            unwrap(draft_args.get("ngram_match_min"), 2) if draft_mode == "ngram" else 0
+            unwrap(_ngm, 2) if draft_mode == "ngram" else unwrap(_ngm, 0)
         )
         if draft_mode == "ngram" and self.ngram_match_min <= 0:
             raise ValueError("ngram_match_min must be greater than 0 for n-gram drafting")
