@@ -717,6 +717,16 @@ class DraftModelConfig(BaseConfigModel):
         ),
         ge=0,
     )
+    replay_max_tokens: Optional[int] = Field(
+        0,
+        description=(
+            "Verified replay: ceiling for hazard-adaptive widening of the hybrid\n"
+            "lane. After enough fully-accepted hybrid rounds in a row, the copy\n"
+            "window aims past hybrid_draft_tokens toward this many tokens per\n"
+            "verification pass (default: 0, off). Requires hybrid_draft_tokens > 0."
+        ),
+        ge=0,
+    )
 
 
 class SamplingConfig(BaseConfigModel):

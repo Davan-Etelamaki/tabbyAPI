@@ -266,6 +266,7 @@ class ExllamaV3Container:
     draft_confidence: float = 0.4
     ngram_match_min: int = 0
     hybrid_draft_tokens: int = 0
+    replay_max_tokens: int = 0
     recurrent_checkpoint_interval: Optional[int] = None
     recurrent_checkpoint_interval_pp: Optional[int] = None
     # Generator arguments for the persistent disk cache tier, resolved per load
@@ -440,6 +441,13 @@ class ExllamaV3Container:
         self.hybrid_draft_tokens = unwrap(draft_args.get("hybrid_draft_tokens"), 0)
         if self.hybrid_draft_tokens < 0:
             raise ValueError("hybrid_draft_tokens must be 0 (off) or greater")
+        # Verified replay: ceiling for the hazard-adaptive widening of the hybrid
+        # lane (exllamav3-04). 0 keeps the lane at its static width.
+        self.replay_max_tokens = unwrap(draft_args.get("replay_max_tokens"), 0)
+        if self.replay_max_tokens < 0:
+            raise ValueError("replay_max_tokens must be 0 (off) or greater")
+        if self.replay_max_tokens and not self.hybrid_draft_tokens:
+            raise ValueError("replay_max_tokens requires hybrid_draft_tokens > 0")
 
         # Always disable draft if params are incorrectly configured
         if draft_mode == "model" and draft_args and draft_model_name is None:
@@ -477,6 +485,11 @@ class ExllamaV3Container:
                 f"Using hybrid drafting: {self.hybrid_draft_tokens} tokens drafted from a "
                 "matching earlier passage of the context."
             )
+            if self.replay_max_tokens > self.hybrid_draft_tokens:
+                xlogger.info(
+                    f"Verified replay armed: hybrid rounds widen up to "
+                    f"{self.replay_max_tokens} tokens after fully-accepted rounds."
+                )
 
         # Turn off GPU split if the user is using 1 GPU
         gpu_count = torch.cuda.device_count()
@@ -1254,6 +1267,7 @@ class ExllamaV3Container:
                 draft_confidence=self.draft_confidence,
                 ngram_match_min=self.ngram_match_min,
                 hybrid_draft_tokens=self.hybrid_draft_tokens,
+                replay_max_tokens=self.replay_max_tokens,
                 **checkpoint_kwargs,
                 **self.disk_cache_kwargs,
             )
