@@ -894,18 +894,6 @@ class ExllamaV3Container:
             case "Q8":
                 raw_cache_mode = "8,8"
 
-        # NVFP4/FP8 KV cache (fork exllamav3): CacheLayer_nvfp4 / CacheLayer_fp8,
-        # target cache only — draft cache stays fp16 (parity-pinned upstream semantics)
-        if raw_cache_mode.upper() in ("NVFP4", "FP8"):
-            from exllamav3.cache import CacheLayer_nvfp4, CacheLayer_fp8
-            nv_layer = CacheLayer_nvfp4 if raw_cache_mode.upper() == "NVFP4" else CacheLayer_fp8
-            return Cache(
-                model,
-                max_num_tokens=self.cache_size,
-                layer_type=nv_layer,
-                **batch_draft_args,
-            )
-
         split_cache_mode = re.search(r"^([2-8])\s*,\s*([2-8])$", raw_cache_mode)
 
         if self.draft_model:
@@ -922,6 +910,18 @@ class ExllamaV3Container:
             "max_history": max(draft_tokens, self.hybrid_draft_tokens),
             "recurrent_dtype": torch.float if self.recurrent_state_fp32 else torch.half,
         }
+
+        # NVFP4/FP8 KV cache (fork exllamav3): CacheLayer_nvfp4 / CacheLayer_fp8,
+        # target cache only — draft cache stays fp16 (parity-pinned upstream semantics)
+        if raw_cache_mode.upper() in ("NVFP4", "FP8"):
+            from exllamav3.cache import CacheLayer_nvfp4, CacheLayer_fp8
+            nv_layer = CacheLayer_nvfp4 if raw_cache_mode.upper() == "NVFP4" else CacheLayer_fp8
+            return Cache(
+                model,
+                max_num_tokens=self.cache_size,
+                layer_type=nv_layer,
+                **batch_draft_args,
+            )
 
         if split_cache_mode:
             draft_k_bits = int(split_cache_mode.group(1))
