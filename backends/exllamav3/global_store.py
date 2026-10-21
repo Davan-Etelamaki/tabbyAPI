@@ -497,3 +497,63 @@ def install():
     _ui("[GS] v3 code loaded")
     _ui(f"[GS] global store installed (ladder {LADDER}, min_key {MIN_KEY}, "
           f"topk {TOPK}, dump {DUMP_SECS}s -> {STORE_PATH or 'off'})")
+# ==== patch-12 MTP-union v2: MTP x FULL ngram union (2026-10-11) ============
+# In draft_mode=mtp the engine bypasses get_ngram_draft, so GS was idle.
+# v2: consult the PATCHED get_ngram_draft (store x context chains, the full
+# ngram union with ladder + arbitration) on every MTP row; if its chain
+# covers the window it takes the row (same length => same verify geometry).
+# Verify accepts true prefixes only, so a wrong pick wastes rows, never text.
+# Kill switch: GS_MTP_UNION=off. Counters: m_try consulted, m_win union row.
+_MTP_UNION = os.environ.get("GS_MTP_UNION", "on")
+
+def _mtp_union_wanted():
+    # T11 law (2026-10-11): a layer that cuts less load than it adds is a tax.
+    # The bridge can only win rows in an MTP boot; in an ngram boot the row IS
+    # the ngram chain, so consultation never yields a longer chain - measured
+    # v1: m_try=10,115, m_win=0. Gate to mtp boots (launcher sets GS_MTP_RIDE).
+    return _MTP_UNION == "on" and os.environ.get("GS_MTP_RIDE", "0") == "1"
+
+def _mtp_union_install():
+    if not _mtp_union_wanted():
+        _ui("[GS] MTP-union idle (ngram boot or GS_MTP_UNION=" + _MTP_UNION +
+            "): bridge armed only for MTP boots - ngram rows are the ngram "
+            "chain, consultation there is pure tax (T11)")
+        return
+    try:
+        from exllamav3.generator import job as _j
+    except Exception as e:
+        _ui("[GS] MTP-union install FAILED (import): " + repr(e))
+        return
+    if getattr(_j.Job, "_gs_mtp_union", False):
+        return
+    _orig_gil = _j.Job.get_input_ids_list
+
+    def _gil(self, draft_tokens=None, idx=0, add_to_cache=False):
+        if draft_tokens is not None and len(self.sequences) == 1:
+            try:
+                w = int(draft_tokens.shape[-1])
+                if w > 0:
+                    _calls["m_try"] += 1
+                    row = self.get_ngram_draft(w)
+                    if row is not None and row.shape[-1] >= w:
+                        dt = row[:, :w].to(dtype=draft_tokens.dtype,
+                                          device=draft_tokens.device)
+                        _calls["m_win"] += 1
+                        return _orig_gil(self, dt, idx, add_to_cache)
+            except Exception:
+                pass
+        return _orig_gil(self, draft_tokens, idx, add_to_cache)
+
+    _j.Job.get_input_ids_list = _gil
+    _j.Job._gs_mtp_union = True
+    _ui("[GS] MTP-union v2 ARMED: full ngram union (store x context) replaces "
+        "MTP rows when it covers the window (GS_MTP_UNION=off to disable)")
+
+def _mtp_union_later():
+    time.sleep(30)
+    try:
+        _mtp_union_install()
+    except Exception as e:
+        _ui("[GS] MTP-union install FAILED: " + repr(e))
+
+threading.Thread(target=_mtp_union_later, daemon=True).start()
