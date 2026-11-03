@@ -743,6 +743,9 @@ class DraftModelConfig(BaseConfigModel):
             "lane. After enough fully-accepted hybrid rounds in a row, the copy\n"
             "window aims past hybrid_draft_tokens toward this many tokens per\n"
             "verification pass (default: 0, off). Requires hybrid_draft_tokens > 0."
+        ),
+        ge=0,
+    )
     draft_max_rows: Optional[int] = Field(
         0,
         description=(
