@@ -154,6 +154,9 @@ adaptive_decay:
   force: false
 
 # MARK: Loop detection
-loop_detect_window:
-  override: 800
+loop_detect:
+  override: true
+  force: false
+loop_detect_error:
+  override: false
   force: false

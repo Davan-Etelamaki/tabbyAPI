@@ -46,6 +46,16 @@
   --code-block-fg: #ececf1;
   --code-head-bg: #343541;
   --code-head-fg: #acacbe;
+  /* Syntax highlighting in code blocks, here for dark ones */
+  --hl-comment: #8b8d98;
+  --hl-keyword: #c678dd;
+  --hl-string: #98c379;
+  --hl-number: #d19a66;
+  --hl-title: #61afef;
+  --hl-type: #e5c07b;
+  --hl-attr: #d19a66;
+  --hl-meta: #56b6c2;
+  --hl-variable: #e06c75;
 
   --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
   --sans: system-ui, -apple-system, "Segoe UI", Roboto, Ubuntu, "Helvetica Neue", Arial, sans-serif;
@@ -119,6 +129,16 @@ svg {
 }
 
 .new-chat:hover { background: var(--sidebar-hover); }
+
+.new-buttons { display: flex; gap: 8px; }
+
+.new-buttons .new-chat {
+  flex: 1;
+  min-width: 0;
+  gap: 8px;
+  padding: 12px 10px;
+  white-space: nowrap;
+}
 
 #session-list {
   flex: 1;
@@ -207,6 +227,8 @@ svg {
   cursor: pointer;
   text-align: left;
 }
+
+a.sidebar-item { color: inherit; text-decoration: none; }
 
 .sidebar-item:hover { background: var(--sidebar-hover); }
 .sidebar-item span:first-of-type { flex: 1; }
@@ -494,6 +516,33 @@ svg {
   white-space: pre;
 }
 
+/* highlight.js marks tokens with hljs-* classes; each theme colors them with its --hl-* palette */
+.markdown pre :is(.hljs-comment, .hljs-quote) { color: var(--hl-comment); font-style: italic; }
+.markdown pre :is(.hljs-keyword, .hljs-selector-tag, .hljs-doctag, .hljs-name) { color: var(--hl-keyword); }
+.markdown pre :is(.hljs-string, .hljs-regexp, .hljs-symbol, .hljs-char, .hljs-link, .hljs-addition,
+  .hljs-selector-attr, .hljs-selector-pseudo) { color: var(--hl-string); }
+.markdown pre :is(.hljs-number, .hljs-literal) { color: var(--hl-number); }
+.markdown pre :is(.hljs-title, .hljs-section) { color: var(--hl-title); }
+.markdown pre :is(.hljs-built_in, .hljs-type, .hljs-title.class_) { color: var(--hl-type); }
+.markdown pre :is(.hljs-attr, .hljs-attribute, .hljs-property, .hljs-selector-class, .hljs-selector-id) { color: var(--hl-attr); }
+.markdown pre :is(.hljs-meta, .hljs-bullet) { color: var(--hl-meta); }
+.markdown pre :is(.hljs-variable, .hljs-template-variable, .hljs-deletion) { color: var(--hl-variable); }
+.markdown pre .hljs-emphasis { font-style: italic; }
+.markdown pre .hljs-strong { font-weight: 700; }
+
+/* Math (KaTeX). Displayed formulas scroll sideways rather than overflow the reply */
+.markdown .math-block { margin: 0 0 1em; }
+.markdown .katex-display {
+  margin: 0.4em 0;
+  padding: 0.2em 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+.markdown .katex { font-size: 1.1em; }
+
+/* TeX source shown for the moment KaTeX takes to load */
+.math-pending { font-family: var(--mono); font-size: 0.92em; }
+
 .markdown blockquote {
   border-left: 3px solid var(--fg-muted);
   padding-left: 12px;
@@ -607,12 +656,147 @@ svg {
   color: var(--fg-muted);
 }
 
+.empty-state a { color: var(--accent); }
+
 .empty-state h1 {
   font-size: 32px;
   font-weight: 600;
   margin: 0 0 8px;
   color: var(--fg);
 }
+
+/* ---- Notebook ---- */
+
+#notebook {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.notebook-editor {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  position: relative;
+}
+
+/* By id, ahead of the general and theme textarea styles. The text keeps to a
+   column like a chat's while the scrollbar stays at the edge of the pane */
+#notebook-text {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  border-radius: 0;
+  outline: none;
+  box-shadow: none;
+  background: transparent;
+  resize: none;
+  padding: 20px max(20px, calc((100% - 860px) / 2));
+  font: 14px/1.65 var(--mono);
+  overflow-wrap: anywhere;
+}
+
+.notebook-start {
+  position: absolute;
+  top: 84px;
+  left: max(20px, calc((100% - 860px) / 2));
+  right: 20px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  font-size: 13px;
+}
+
+.notebook-options {
+  flex: 0 1 40%;
+  min-height: 120px;
+  overflow-y: auto;
+  padding: 8px max(20px, calc((100% - 860px) / 2));
+  border-top: 1px solid var(--border);
+}
+
+.notebook-options .section-head { margin-bottom: 4px; }
+
+.option-list.stale { opacity: 0.55; }
+
+.option {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  width: 100%;
+  padding: 3px 8px;
+  border: 0;
+  border-radius: 4px;
+  /* The bar behind a row shows its probability */
+  background: linear-gradient(to right, var(--accent-soft) var(--prob), transparent var(--prob));
+  cursor: pointer;
+  text-align: left;
+  font: 13px/1.5 var(--mono);
+}
+
+.option:hover { outline: 1px solid var(--accent); }
+
+.option-prob {
+  flex: none;
+  width: 4ch;
+  text-align: right;
+  font-size: 12px;
+  color: var(--fg-muted);
+}
+
+.option-text {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.option-first { font-weight: 700; }
+.option-mark { color: var(--fg-muted); }
+
+.option-end {
+  flex: none;
+  font-size: 11px;
+  color: var(--fg-muted);
+}
+
+.notebook-bar {
+  flex: none;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+  padding: 8px 16px 6px;
+  border-top: 1px solid var(--border);
+}
+
+.notebook-bar .ghost-button:disabled { opacity: 0.5; cursor: default; }
+.notebook-bar .ghost-button[aria-pressed="true"] { border-color: var(--accent); font-weight: 600; }
+
+.notebook-bar kbd {
+  font: 11px var(--mono);
+  opacity: 0.7;
+}
+
+.notebook-count {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--fg-muted);
+}
+
+.notebook-count input { width: 76px; }
+
+.notebook-status {
+  flex: 1 1 100%;
+  min-height: 18px;
+  font-size: 12px;
+  color: var(--fg-muted);
+}
+
+.notebook-status.error { color: var(--danger); }
 
 /* ---- Composer ---- */
 
@@ -752,23 +936,32 @@ svg {
   cursor: default;
 }
 
-.image-viewer {
+/* Sized to the image and centered. A modal dialog is positioned with inset 0
+   and auto margins, so any width other than fit-content stretches it across
+   the screen with the image at its left edge. By id, so the themes' dialog
+   frames (borders, padding, gradients) stay off it */
+#image-viewer {
   padding: 0;
   border: 0;
+  border-radius: 0;
   background: transparent;
   box-shadow: none;
-  width: auto;
+  width: fit-content;
+  height: fit-content;
   max-width: 95vw;
   max-height: 95vh;
+  overflow: visible;
   cursor: zoom-out;
 }
 
-.image-viewer::backdrop { background: rgba(0, 0, 0, 0.8); }
+#image-viewer::backdrop { background: rgba(0, 0, 0, 0.8); backdrop-filter: none; }
 
-.image-viewer img {
+#image-viewer img {
   display: block;
   max-width: 95vw;
   max-height: 95vh;
+  object-fit: contain;
+  border-radius: 4px;
 }
 
 .composer textarea {
@@ -863,6 +1056,12 @@ svg {
 
 .model-info dd { margin: 0; color: var(--fg); overflow-wrap: anywhere; }
 
+.status-link {
+  display: block;
+  color: var(--accent);
+  font-size: 12.5px;
+}
+
 .filter {
   width: 100%;
   margin-bottom: 6px;
@@ -940,6 +1139,9 @@ svg {
   font-family: var(--mono);
   font-size: 12px;
 }
+
+.load-options .button-row { margin-top: 4px; }
+.load-options .button-row button { padding: 3px 10px; font-size: 12.5px; }
 
 .button-row {
   display: flex;

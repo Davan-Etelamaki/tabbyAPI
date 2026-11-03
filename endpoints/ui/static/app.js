@@ -1,70 +1,41 @@
 // TabbyAPI chat client. Plain browser JavaScript with no build step: it calls
-// the regular API (chat completions, model and sampler override endpoints) and
-// keeps its chats and settings in the browser's local storage.
+// the regular API (chat completions, plain completions for raw text sessions,
+// model and sampler override endpoints) and keeps its sessions and settings in
+// the browser's local storage.
 
 import "./effects.js";
-
-const $ = (id) => document.getElementById(id);
-const STORE = "tabby-ui.";
-
-// ---------------------------------------------------------------------------
-// Storage
-
-let storageWarned = false;
-
-function load(key, fallback) {
-  try {
-    const raw = localStorage.getItem(STORE + key);
-    return raw === null ? fallback : JSON.parse(raw);
-  } catch {
-    return fallback;
-  }
-}
-
-function save(key, value) {
-  try {
-    localStorage.setItem(STORE + key, JSON.stringify(value));
-  } catch (e) {
-    if (!storageWarned) {
-      storageWarned = true;
-      setStatus(`Could not save to browser storage (${e.name}). Delete some chats to free space.`, true);
-    }
-  }
-}
-
-function remove(key) {
-  try {
-    localStorage.removeItem(STORE + key);
-  } catch {
-    // Nothing to clean up if storage is unavailable
-  }
-}
+import {
+  $,
+  STORE,
+  MODEL_CHANGED_KEY,
+  api,
+  copyText,
+  el,
+  fmt,
+  icon,
+  load,
+  newId,
+  onStorageError,
+  remove,
+  save,
+  settings,
+  sseData,
+  takeKeyFromLink,
+} from "./shared.js";
 
 // ---------------------------------------------------------------------------
 // State
 
-const settings = Object.assign({ baseUrl: "", apiKey: "", theme: "", markdown: true }, load("settings", {}));
-// Theme names from before the theme menu ("light", "dark") map to their new names
-settings.theme = window.tabbyTheme.normalize(settings.theme);
 let params = load("params", {});
-// Model names loaded through the client, newest first. The model list only has
-// the top-level folders of the model directory, so nested ones (typed as a
-// path) would otherwise have to be typed again every time.
-let recentModels = load("recent-models", []);
-// Starred model names, shown at the top of the model list
-let favoriteModels = load("favorite-models", []);
 let sessionIndex = load("sessions", []);
 let session = null;
 
 const state = {
   permission: null,
-  models: [],
   currentModel: null,
   // Full path of the loaded model, and its name in the model list if listed
   modelPath: null,
   loadedName: null,
-  selectedModel: null,
-  loading: false,
   overrides: null,
   generating: null,
 };
@@ -73,146 +44,99 @@ let samplerGroups = [];
 const paramSpecs = new Map();
 
 // ---------------------------------------------------------------------------
-// API
-
-class ApiError extends Error {
-  constructor(status, message) {
-    super(message);
-    this.status = status;
-  }
-}
-
-function apiUrl(path) {
-  return settings.baseUrl.replace(/\/+$/, "") + path;
-}
-
-async function errorMessage(res) {
-  try {
-    const body = await res.json();
-    const detail = body.detail ?? body.error?.message ?? body.error ?? body;
-    if (Array.isArray(detail)) {
-      return detail.map((d) => `${(d.loc || []).join(".")}: ${d.msg}`).join("\n");
-    }
-    return typeof detail === "string" ? detail : JSON.stringify(detail);
-  } catch {
-    return `${res.status} ${res.statusText}`;
-  }
-}
-
-async function api(path, { method = "GET", body, signal } = {}) {
-  const headers = {};
-  if (settings.apiKey) headers.Authorization = `Bearer ${settings.apiKey}`;
-  if (body !== undefined) headers["Content-Type"] = "application/json";
-
-  const res = await fetch(apiUrl(path), {
-    method,
-    headers,
-    body: body === undefined ? undefined : JSON.stringify(body),
-    signal,
-  });
-
-  if (!res.ok) throw new ApiError(res.status, await errorMessage(res));
-  return res;
-}
-
-// Yields the data field of each server-sent event in a streaming response
-async function* sseData(res) {
-  const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
-  let buffer = "";
-
-  for (;;) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buffer += value;
-
-    let match;
-    while ((match = /\r\n\r\n|\n\n|\r\r/.exec(buffer))) {
-      const block = buffer.slice(0, match.index);
-      buffer = buffer.slice(match.index + match[0].length);
-
-      const data = block
-        .split(/\r\n|\r|\n/)
-        .filter((line) => line.startsWith("data:"))
-        .map((line) => line.slice(5).replace(/^ /, ""));
-      if (data.length) yield data.join("\n");
-    }
-  }
-}
-
-// ---------------------------------------------------------------------------
 // Helpers
 
-function el(tag, attrs = {}, ...children) {
-  const node = document.createElement(tag);
-  for (const [key, value] of Object.entries(attrs)) {
-    if (value === undefined || value === null || value === false) continue;
-    if (key === "class") node.className = value;
-    else if (key.startsWith("on")) node.addEventListener(key.slice(2), value);
-    else if (key in node && typeof value !== "string") node[key] = value;
-    else node.setAttribute(key, value === true ? "" : value);
-  }
-  for (const child of children.flat()) {
-    if (child === null || child === undefined || child === false) continue;
-    node.append(child instanceof Node ? child : document.createTextNode(String(child)));
-  }
-  return node;
-}
-
-const ICONS = {
-  chat: '<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>',
-  edit: '<path d="M12 20h9M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/>',
-  trash: '<path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6"/>',
-  copy: '<rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>',
-  check: '<path d="M20 6 9 17l-5-5"/>',
-  reset: '<path d="M18 6 6 18M6 6l12 12"/>',
-  star: '<path d="M12 3l2.8 5.7 6.2.9-4.5 4.4 1.1 6.2L12 17.3l-5.6 2.9 1.1-6.2L3 9.6l6.2-.9z"/>',
-  image: '<rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-5-5L5 21"/>',
-};
-
-function icon(name) {
-  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-  svg.setAttribute("viewBox", "0 0 24 24");
-  svg.setAttribute("aria-hidden", "true");
-  svg.innerHTML = ICONS[name];
-  return svg;
-}
-
-function newId() {
-  // crypto.randomUUID is missing outside secure contexts (plain http on a LAN)
-  return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
-}
-
-function fmt(value, digits = 1) {
-  return typeof value === "number" ? value.toFixed(digits) : value;
-}
-
 function setStatus(text, isError = false) {
-  const line = $("status-line");
-  line.textContent = text || "";
-  line.classList.toggle("error", isError);
-}
-
-async function copyText(text) {
-  try {
-    await navigator.clipboard.writeText(text);
-  } catch {
-    // The async clipboard API needs a secure context; fall back for plain http
-    const area = el("textarea", { style: "position:fixed;opacity:0" });
-    area.value = text;
-    document.body.append(area);
-    area.select();
-    document.execCommand("copy");
-    area.remove();
+  for (const id of ["status-line", "notebook-status"]) {
+    const line = $(id);
+    line.textContent = text || "";
+    line.classList.toggle("error", isError);
   }
 }
 
 // ---------------------------------------------------------------------------
 // Markdown
 
+// highlight.js and KaTeX are loaded the first time a reply needs them, so a
+// page without code or math never fetches them. Once one arrives, the replies
+// on screen are formatted again with it.
+const LIBRARIES = {
+  highlight: {
+    scripts: [
+      "vendor/highlight.js/highlight.min.js",
+      // Beyond the common languages the main file bundles
+      ...["dockerfile", "powershell", "cmake", "latex"].map((l) => `vendor/highlight.js/languages/${l}.min.js`),
+    ],
+    styles: [],
+  },
+  katex: { scripts: ["vendor/katex/katex.min.js"], styles: ["vendor/katex/katex.min.css"] },
+};
+const libraryLoads = {};
+
+function loadLibrary(name) {
+  if (libraryLoads[name]) return;
+  const { scripts, styles } = LIBRARIES[name];
+  const load = (tag, attrs) =>
+    new Promise((resolve, reject) => {
+      const node = el(tag, attrs);
+      node.addEventListener("load", resolve);
+      node.addEventListener("error", () => reject(new Error(`Could not load ${attrs.src || attrs.href}`)));
+      document.head.append(node);
+    });
+  libraryLoads[name] = (async () => {
+    // In order: the language files register with the main highlight.js file
+    for (const src of scripts) await load("script", { src });
+    await Promise.all(styles.map((href) => load("link", { rel: "stylesheet", href })));
+  })().then(reformatReplies, (e) => console.warn(e.message));
+}
+
+// The message each formatted reply on screen shows, to format it again
+const formattedContent = new WeakMap();
+
+function reformatReplies() {
+  const stick = nearBottom();
+  for (const node of document.querySelectorAll("#messages .content.markdown")) {
+    const msg = formattedContent.get(node);
+    if (msg) setContent(node, msg);
+  }
+  if (stick) scrollToBottom();
+}
+
+// Highlighted code by language and source. Replies re-render on every
+// streamed token, so code that hasn't changed isn't highlighted again
+const highlightedCode = new Map();
+
+function highlightCode(code, lang) {
+  lang = lang.toLowerCase();
+  if (!lang) return "";
+  const hljs = window.hljs;
+  if (!hljs) {
+    loadLibrary("highlight");
+    return "";
+  }
+  if (!hljs.getLanguage(lang)) return "";
+
+  const key = `${lang}\n${code}`;
+  let html = highlightedCode.get(key);
+  if (html === undefined) {
+    try {
+      html = hljs.highlight(code, { language: lang, ignoreIllegals: true }).value;
+    } catch {
+      html = "";
+    }
+  } else highlightedCode.delete(key);
+  highlightedCode.set(key, html);
+  if (highlightedCode.size > 64) highlightedCode.delete(highlightedCode.keys().next().value);
+  return html;
+}
+
 // markdown-it (vendor/markdown-it.min.js) with its safe defaults: HTML in a
 // reply is shown as text, and javascript:, vbscript: and file: links are
 // refused. Single newlines are kept as line breaks, as models tend to mean them.
-const markdown = window.markdownit ? window.markdownit({ linkify: true, breaks: true }) : null;
+// highlight.js output is escaped HTML, with spans marking the tokens.
+const markdown = window.markdownit
+  ? window.markdownit({ linkify: true, breaks: true, highlight: highlightCode })
+  : null;
 
 if (markdown) {
   // Links open in a new tab, without a handle back to this page
@@ -237,6 +161,132 @@ if (markdown) {
     const href = markdown.utils.escapeHtml(src);
     return `<a class="remote-image" href="${href}" target="_blank" rel="noopener noreferrer">${markdown.utils.escapeHtml(alt)}</a>`;
   };
+}
+
+// Math, typeset by KaTeX: $…$ and \(…\) inline, $$…$$ and \[…\] displayed,
+// either on lines of their own or within a paragraph. Single dollars follow
+// Pandoc's rule so prices stay text: no space just inside either one, and no
+// digit right after the closing one ("$5 and $10" isn't math).
+const typesetMath = new Map();
+
+function renderMath(tex, display, source) {
+  const katex = window.katex;
+  if (!katex) {
+    loadLibrary("katex");
+    return `<span class="math-pending">${markdown.utils.escapeHtml(source)}</span>`;
+  }
+
+  const key = `${display ? "D" : "I"}${tex}`;
+  let html = typesetMath.get(key);
+  if (html === undefined) {
+    try {
+      // Bad TeX comes out as its source in the error color, with the error as a tooltip.
+      // Without trust, commands like \href and \includegraphics are refused
+      html = katex.renderToString(tex, { displayMode: display, throwOnError: false, strict: "ignore" });
+    } catch {
+      html = `<span class="math-pending">${markdown.utils.escapeHtml(source)}</span>`;
+    }
+  } else typesetMath.delete(key);
+  typesetMath.set(key, html);
+  if (typesetMath.size > 256) typesetMath.delete(typesetMath.keys().next().value);
+  return html;
+}
+
+const MATH_DELIMITERS = [
+  ["\\(", "\\)", false],
+  ["\\[", "\\]", true],
+  ["$$", "$$", true],
+  ["$", "$", false],
+];
+
+function mathInline(state, silent) {
+  const src = state.src;
+  const start = state.pos;
+  const delimiters = MATH_DELIMITERS.find(([open]) => src.startsWith(open, start));
+  if (!delimiters) return false;
+  const [open, close, display] = delimiters;
+  const from = start + open.length;
+
+  let end;
+  if (open === "$") {
+    if (!src[from] || /[\s$]/.test(src[from])) return false;
+    end = from;
+    for (;;) {
+      end = src.indexOf("$", end + 1);
+      if (end < 0) return false;
+      if (src[end - 1] === "\\") continue;
+      if (!/\s/.test(src[end - 1]) && !/[0-9]/.test(src[end + 1] || "")) break;
+      // Any other dollar means this one was a price: "$5 and $10"
+      return false;
+    }
+    // Nor does math run into a code span: "$5 or `$x`"
+    if (src.slice(from, end).includes("`")) return false;
+  } else {
+    end = src.indexOf(close, from);
+    if (end < 0) return false;
+  }
+
+  const tex = src.slice(from, end);
+  if (!tex.trim()) return false;
+  if (!silent) {
+    const token = state.push(display ? "math_display" : "math_inline", "", 0);
+    token.content = tex;
+    token.markup = open;
+    token.info = close;
+  }
+  state.pos = end + close.length;
+  return true;
+}
+
+// $$ or \[ starting a line, up to a line that ends with $$ or \]
+function mathBlock(state, startLine, endLine, silent) {
+  if (state.sCount[startLine] - state.blkIndent >= 4) return false;
+  const lineText = (line) => state.src.slice(state.bMarks[line] + state.tShift[line], state.eMarks[line]);
+  const first = lineText(startLine);
+  const delimiters = MATH_DELIMITERS.find(([open, , display]) => display && first.startsWith(open));
+  if (!delimiters) return false;
+  const [open, close] = delimiters;
+
+  const lines = [first.slice(open.length)];
+  let line = startLine;
+  for (;;) {
+    const text = lines[lines.length - 1].trimEnd();
+    if (text.endsWith(close) && !(line === startLine && text.length < close.length)) {
+      lines[lines.length - 1] = text.slice(0, -close.length);
+      break;
+    }
+    if (++line >= endLine) return false;
+    lines.push(lineText(line));
+  }
+  // "$$a$$ and more" on one line is inline math in a paragraph, not a block
+  if (line === startLine && first.trimEnd() !== `${open}${lines[0]}${close}`) return false;
+
+  const tex = lines.join("\n");
+  if (!tex.trim()) return false;
+  if (silent) return true;
+  state.line = line + 1;
+  const token = state.push("math_block", "", 0);
+  token.block = true;
+  token.content = tex;
+  token.markup = open;
+  token.info = close;
+  token.map = [startLine, state.line];
+  return true;
+}
+
+if (markdown) {
+  // Ahead of backslash escapes, which would turn \( into (
+  markdown.inline.ruler.before("escape", "math_inline", mathInline);
+  // Ahead of every other block rule: the lines of a formula can look like Markdown, and
+  // an "=" or "-" line would otherwise make a heading of the lines above it
+  markdown.block.ruler.before("table", "math_block", mathBlock, {
+    alt: ["paragraph", "reference", "blockquote", "list"],
+  });
+  const source = (token) => `${token.markup}${token.content}${token.info}`;
+  markdown.renderer.rules.math_inline = (tokens, idx) => renderMath(tokens[idx].content, false, source(tokens[idx]));
+  markdown.renderer.rules.math_display = (tokens, idx) => renderMath(tokens[idx].content, true, source(tokens[idx]));
+  markdown.renderer.rules.math_block = (tokens, idx) =>
+    `<div class="math-block">${renderMath(tokens[idx].content, true, source(tokens[idx]))}</div>\n`;
 }
 
 // Code blocks get a header with the language and a copy button. SVG code
@@ -387,6 +437,7 @@ function addSvgPreviews(node, streaming) {
 function setContent(node, msg) {
   if (markdown && settings.markdown && msg.role === "assistant") {
     node.classList.add("markdown");
+    formattedContent.set(node, msg);
     node.innerHTML = markdown.render(msg.content);
     addSvgPreviews(node, state.generating?.message === msg);
   } else {
@@ -622,8 +673,12 @@ function renderImages(ids) {
 // ---------------------------------------------------------------------------
 // Sessions
 
+function isNotebook(s) {
+  return s?.kind === "notebook";
+}
+
 function sessionSummary(s) {
-  return { id: s.id, title: s.title, updated: s.updated };
+  return { id: s.id, title: s.title, updated: s.updated, kind: s.kind };
 }
 
 function persistSession(s = session) {
@@ -648,32 +703,33 @@ function createSession() {
   return s;
 }
 
+function showSession(s) {
+  leaveNotebook();
+  session = s;
+  save("current", s.id);
+  renderSessionList();
+  renderSession();
+  closeDrawers();
+}
+
 function openSession(id) {
-  // A chat that is still streaming lives in memory, ahead of its stored copy
+  // A session that is still streaming lives in memory, ahead of its stored copy
   const s = state.generating?.session.id === id ? state.generating.session : load(`session.${id}`, null);
   if (!s) {
     sessionIndex = sessionIndex.filter((x) => x.id !== id);
     save("sessions", sessionIndex);
     return false;
   }
-  session = s;
-  save("current", id);
-  renderSessionList();
-  renderThread();
-  closeDrawers();
+  showSession(s);
   return true;
 }
 
 function newChat() {
-  if (session && session.messages.length === 0) {
+  if (session?.messages?.length === 0) {
     $("input").focus();
     return;
   }
-  session = createSession();
-  save("current", session.id);
-  renderSessionList();
-  renderThread();
-  closeDrawers();
+  showSession(createSession());
   $("input").focus();
 }
 
@@ -682,6 +738,7 @@ function deleteSession(id) {
     state.generating.session.deleted = true;
     state.generating.controller.abort();
   }
+  if (unsavedNotebook?.id === id) unsavedNotebook = null;
   remove(`session.${id}`);
   sessionIndex = sessionIndex.filter((x) => x.id !== id);
   save("sessions", sessionIndex);
@@ -689,11 +746,7 @@ function deleteSession(id) {
 
   if (session?.id === id) {
     session = null;
-    if (!sessionIndex.length || !openSession(sessionIndex[0].id)) {
-      session = createSession();
-      save("current", session.id);
-      renderThread();
-    }
+    if (!sessionIndex.length || !openSession(sessionIndex[0].id)) showSession(createSession());
   }
   renderSessionList();
 }
@@ -717,7 +770,7 @@ function renderSessionList() {
         title: item.title,
         onclick: () => item.id !== session?.id && openSession(item.id),
       },
-      icon("chat"),
+      icon(item.kind === "notebook" ? "text" : "chat"),
     );
     const title = el("span", { class: "session-title" }, item.title);
 
@@ -742,6 +795,20 @@ function renderSessionList() {
     const actions = el(
       "span",
       { class: "session-actions" },
+      item.kind === "notebook"
+        ? null
+        : el(
+            "button",
+            {
+              type: "button",
+              title: "Copy to a raw text session",
+              onclick: (e) => {
+                e.stopPropagation();
+                convertToNotebook(item.id);
+              },
+            },
+            icon("text"),
+          ),
       el("button", { type: "button", title: "Rename", onclick: startRename }, icon("edit")),
       el(
         "button",
@@ -860,6 +927,18 @@ function renderMessage(msg, index) {
   );
 }
 
+function renderSession() {
+  const raw = isNotebook(session);
+  $("thread").hidden = raw;
+  $("composer-area").hidden = raw;
+  $("notebook").hidden = !raw;
+  setStatus("");
+
+  if (state.panelMode !== panelMode()) renderParams();
+  if (raw) renderNotebook();
+  else renderThread();
+}
+
 function renderThread() {
   live = null;
   const container = $("messages");
@@ -905,6 +984,10 @@ function updateSystemPreview() {
 }
 
 function updateComposer() {
+  if (isNotebook(session)) {
+    updateNotebookBar();
+    return;
+  }
   const busy = !!state.generating;
   const last = session.messages[session.messages.length - 1];
   $("stop").hidden = !busy;
@@ -968,7 +1051,9 @@ async function buildMessages(s) {
     // Skip failed or stopped-before-output turns
     if (m.role === "assistant" && !m.content) continue;
     if (!m.images?.length) {
-      messages.push({ role: m.role, content: m.content });
+      // Send the assistant's reasoning back with its turn ("preserve thinking"),
+      // so the model sees the full prior turn, not just the final answer
+      messages.push({ role: m.role, content: m.content, ...(m.reasoning ? { reasoning_content: m.reasoning } : {}) });
       continue;
     }
 
@@ -1050,6 +1135,8 @@ async function generate() {
     state.generating = null;
     if (!s.deleted) persistSession(s);
     if (session === s) renderThread();
+    else updateComposer();
+    queueOptions(0);
     if (msg.error) setStatus(msg.error, true);
   }
 }
@@ -1104,6 +1191,518 @@ function autosize() {
 }
 
 // ---------------------------------------------------------------------------
+// Notebook
+
+// A raw text session keeps its whole context as text, sent as is through the
+// completions endpoint, so it works without a chat template. The text before
+// the cursor is the prompt, and output goes in at the cursor like typing:
+// through the browser's editing commands where possible, so Ctrl+Z takes it
+// back again. What a session holds is `text`; the textarea follows it.
+
+const NEW_NOTEBOOK_TITLE = "New notebook";
+const NOTEBOOK_SAVE_DELAY = 600;
+const DEFAULT_NOTEBOOK_TOKENS = 128;
+// A step ends at the first text, which only a run of partial characters or a
+// long possible stop string can put off for long. This bounds that run
+const STEP_MAX_TOKENS = 64;
+const TEMPLATE_PLACEHOLDER_SYSTEM = "You are a helpful assistant.";
+const TEMPLATE_PLACEHOLDER_USER = "User message";
+// The panel's settings that go into the chat template rather than the sampler
+const TEMPLATE_PARAMS = ["enable_thinking", "reasoning_effort", "template_vars", "response_prefix"];
+
+let unsavedNotebook = null;
+let notebookSaveTimer = null;
+
+// Long enough for moving the cursor or typing to settle
+const OPTIONS_DELAY = 300;
+// The request behind the continuations on show, or on its way
+const notebookOptions = { key: null, prompt: null, controller: null, timer: null };
+
+function createNotebook(title = NEW_NOTEBOOK_TITLE, text = "") {
+  const s = { id: newId(), kind: "notebook", title, text, created: Date.now(), updated: Date.now() };
+  persistSession(s);
+  return s;
+}
+
+function newNotebook() {
+  if (!isNotebook(session) || session.text) showSession(createNotebook());
+  $("notebook-text").focus();
+}
+
+function queueNotebookSave(s) {
+  unsavedNotebook = s;
+  clearTimeout(notebookSaveTimer);
+  notebookSaveTimer = setTimeout(saveNotebook, NOTEBOOK_SAVE_DELAY);
+}
+
+function saveNotebook() {
+  clearTimeout(notebookSaveTimer);
+  if (unsavedNotebook) persistSession(unsavedNotebook);
+  unsavedNotebook = null;
+}
+
+// Keeps the place in a notebook being left. Moving the cursor isn't a change
+// to the session, so this leaves its spot in the list alone.
+function leaveNotebook() {
+  saveNotebook();
+  if (!isNotebook(session) || session.deleted) return;
+  const area = $("notebook-text");
+  session.cursor = area.selectionEnd;
+  session.scroll = area.scrollTop;
+  if (state.generating?.session !== session) save(`session.${session.id}`, session);
+}
+
+function optionsShown() {
+  return isNotebook(session) && !!load("notebook-options", false);
+}
+
+function applyOptionsPanel() {
+  const shown = !!load("notebook-options", false);
+  $("notebook-options").hidden = !shown;
+  $("notebook-options-toggle").setAttribute("aria-pressed", String(shown));
+}
+
+function toggleOptionsPanel() {
+  save("notebook-options", !load("notebook-options", false));
+  applyOptionsPanel();
+  if (load("notebook-options", false)) queueOptions(0);
+  else cancelOptions();
+}
+
+function cancelOptions() {
+  clearTimeout(notebookOptions.timer);
+  notebookOptions.controller?.abort();
+  notebookOptions.controller = null;
+}
+
+function queueOptions(delay = OPTIONS_DELAY) {
+  clearTimeout(notebookOptions.timer);
+  if (optionsShown()) notebookOptions.timer = setTimeout(refreshOptions, delay);
+}
+
+// Drops what's known, for when the same text would now give different results
+function invalidateOptions() {
+  notebookOptions.key = null;
+  queueOptions(0);
+}
+
+function setOptionsMessage(text, isError = false) {
+  const note = $("notebook-options-note");
+  note.textContent = text;
+  note.classList.toggle("error", isError);
+}
+
+async function refreshOptions() {
+  if (!optionsShown() || state.generating) return;
+  const area = $("notebook-text");
+
+  let body;
+  try {
+    body = { ...collectParams(), prompt: area.value.slice(0, area.selectionStart) };
+  } catch (e) {
+    setOptionsMessage(e.message, true);
+    return;
+  }
+
+  const key = JSON.stringify(body);
+  if (key === notebookOptions.key) return;
+  cancelOptions();
+  notebookOptions.key = key;
+
+  const controller = new AbortController();
+  notebookOptions.controller = controller;
+  $("notebook-options-list").classList.add("stale");
+  try {
+    const res = await api("/v1/continuations", { method: "POST", body, signal: controller.signal });
+    const data = await res.json();
+    if (controller.signal.aborted) return;
+    notebookOptions.prompt = body.prompt;
+    renderOptions(data);
+  } catch (e) {
+    if (controller.signal.aborted) return;
+    notebookOptions.key = null;
+    notebookOptions.prompt = null;
+    $("notebook-options-list").replaceChildren();
+    $("notebook-options-state").textContent = "";
+    setOptionsMessage(e.message, true);
+  } finally {
+    if (notebookOptions.controller === controller) {
+      notebookOptions.controller = null;
+      $("notebook-options-list").classList.remove("stale");
+    }
+  }
+}
+
+// Whitespace is what most options differ in, and can't be seen as it is
+function optionText(text) {
+  const parts = [];
+  for (const part of text.split(/(\n|\t|^ +| +$)/)) {
+    if (!part) continue;
+    if (part === "\n") parts.push(el("span", { class: "option-mark" }, "\u21b5"));
+    else if (part === "\t") parts.push(el("span", { class: "option-mark" }, "\u2192"));
+    else if (!part.trim()) parts.push(el("span", { class: "option-mark" }, "\u00b7".repeat(part.length)));
+    else parts.push(part);
+  }
+  return parts;
+}
+
+const OPTION_ENDS = { branch: "ends at a branch point", stop: "ends the generation", limit: "goes on past here" };
+
+function renderOptions(data) {
+  $("notebook-options-list").replaceChildren(
+    ...data.options.map((option) => {
+      const rest = option.text.slice(option.first.length);
+      const percent = option.prob * 100;
+      const count = `${option.token_ids.length} token${option.token_ids.length === 1 ? "" : "s"}`;
+      return el(
+        "button",
+        {
+          type: "button",
+          class: "option",
+          style: `--prob: ${percent.toFixed(1)}%`,
+          title: `${percent.toFixed(1)}%, ${count}, ${OPTION_ENDS[option.end]}`,
+          onclick: () => chooseOption(option),
+        },
+        el("span", { class: "option-prob" }, percent >= 10 ? percent.toFixed(0) : percent.toFixed(1)),
+        el(
+          "span",
+          { class: "option-text" },
+          el("span", { class: "option-first" }, optionText(option.first)),
+          optionText(rest),
+        ),
+        option.end === "branch" ? null : el("span", { class: "option-end" }, option.end === "stop" ? "stop" : "\u2026"),
+      );
+    }),
+  );
+
+  const shown = data.options.length;
+  const of = data.candidates > shown ? ` of ${data.candidates}` : "";
+  $("notebook-options-state").textContent =
+    `${shown}${of} path${shown === 1 && !of ? "" : "s"} · ${data.generated_tokens} tok in ${fmt(data.time, 2)} s`;
+  setOptionsMessage(data.truncated ? "" : "No truncation is set, so every token is a branch point. Set top-P, top-K or min-P for longer paths.");
+}
+
+function chooseOption(option) {
+  const s = session;
+  const area = $("notebook-text");
+  const start = area.selectionStart;
+  // The list can be behind if the cursor has only just moved
+  if (state.generating || area.value.slice(0, start) !== notebookOptions.prompt) return;
+
+  const end = area.selectionEnd;
+  const text = option.text.replace(/\r\n?/g, "\n");
+  area.focus();
+  s.text = s.text.slice(0, start) + text + s.text.slice(end);
+  nameNotebook(s);
+  writeToEditor(start, end, text);
+  updateNotebookBar();
+  queueNotebookSave(s);
+  queueOptions(0);
+}
+
+function updateNotebookBar() {
+  if (!isNotebook(session)) return;
+  const busy = !!state.generating;
+  $("notebook-step").disabled = busy;
+  $("notebook-run").disabled = busy;
+  $("notebook-stop").disabled = !busy;
+  $("notebook-start").hidden = !!session.text;
+
+  const model = state.currentModel;
+  const template = model?.parameters?.prompt_template;
+  $("notebook-template").disabled = !template;
+  $("notebook-template-note").textContent = template ? "" : model ? "This model has no chat template" : "No model loaded";
+}
+
+// Setting a textarea's value leaves its undo history in place, and redo then
+// replays old edits into the new text. So does setRangeText. Only a new element
+// starts without one.
+function freshEditor() {
+  const old = $("notebook-text");
+  const area = old.cloneNode(false);
+  const focused = document.activeElement === old;
+  old.replaceWith(area);
+  if (focused) area.focus();
+  return area;
+}
+
+function renderNotebook() {
+  const area = freshEditor();
+  area.value = session.text;
+  const cursor = Math.min(session.cursor ?? session.text.length, session.text.length);
+  area.setSelectionRange(cursor, cursor);
+  area.scrollTop = session.scroll ?? (cursor === session.text.length ? area.scrollHeight : 0);
+  if (state.generating?.session === session) {
+    state.generating.scrollTop = area.scrollTop;
+    state.generating.edits = null;
+    state.generating.fresh = true;
+  }
+  updateNotebookBar();
+  applyOptionsPanel();
+  invalidateOptions();
+}
+
+// Replaces start..end of the textarea with text. Output arrives while the
+// reader may be scrolled elsewhere: the view follows the cursor unless they
+// moved it, and goes back to following once they return to the bottom.
+function writeToEditor(start, end, text, view = {}) {
+  let area = $("notebook-text");
+  const moved = view.scrollTop !== undefined && area.scrollTop !== view.scrollTop;
+  if (moved) view.follow = area.scrollHeight - area.scrollTop - area.clientHeight < 80;
+  const scrollTop = area.scrollTop;
+
+  view.inserting = true;
+  let inserted = false;
+  if (document.activeElement === area) {
+    area.setSelectionRange(start, end);
+    inserted = document.execCommand("insertText", false, text);
+  }
+  if (inserted) {
+    if (view.edits !== null) view.edits = (view.edits || 0) + 1;
+    view.fresh = false;
+  } else {
+    // The editing commands need the focus, which has gone elsewhere. This
+    // gives up the undo history, as a new element is the only safe way to set
+    // the text.
+    const value = area.value;
+    if (!view.fresh) area = freshEditor();
+    area.value = value.slice(0, start) + text + value.slice(end);
+    area.setSelectionRange(start + text.length, start + text.length);
+    view.edits = null;
+    view.fresh = true;
+  }
+  view.inserting = false;
+
+  if (view.follow === false || !inserted) area.scrollTop = scrollTop;
+  view.scrollTop = area.scrollTop;
+}
+
+// Output arrives as an edit per frame. Taking those back and inserting it all
+// in one go leaves a single Ctrl+Z for the whole run, and nothing paints between
+// the two.
+function mergeOutputEdits(gen) {
+  const area = $("notebook-text");
+  if (!(gen.edits > 1) || document.activeElement !== area) return;
+
+  const scrollTop = area.scrollTop;
+  gen.inserting = true;
+  for (let i = 0; i < gen.edits; i++) document.execCommand("undo");
+  area.setSelectionRange(gen.first, gen.firstEnd);
+  document.execCommand("insertText", false, gen.output);
+  gen.inserting = false;
+  area.scrollTop = scrollTop;
+  if (area.value !== gen.session.text) renderNotebook();
+}
+
+function flushOutput(gen) {
+  gen.outputQueued = false;
+  const text = gen.pending;
+  if (!text) return;
+  gen.pending = "";
+
+  const s = gen.session;
+  s.text = s.text.slice(0, gen.start) + text + s.text.slice(gen.end);
+  gen.output += text;
+  if (session === s) writeToEditor(gen.start, gen.end, text, gen);
+  gen.start += text.length;
+  gen.end = gen.start;
+  if (session === s) updateNotebookBar();
+}
+
+function addOutput(gen, text) {
+  // A textarea only holds \n, and positions in it have to match the session's
+  gen.pending += text.replace(/\r\n?/g, "\n");
+  if (!gen.outputQueued) {
+    gen.outputQueued = true;
+    requestAnimationFrame(() => flushOutput(gen));
+  }
+}
+
+// Named after the first line of actual text, passing over any that open with
+// template markup, like a chat is after its first message
+function nameNotebook(s) {
+  if (s.title !== NEW_NOTEBOOK_TITLE) return;
+  const line = s.text.split("\n").find((l) => l.trim() && !l.trim().startsWith("<"));
+  if (line) s.title = line.replace(/<[^<>\s]+>/g, "").trim().slice(0, 48) || s.title;
+}
+
+async function sample(step) {
+  if (state.generating || !isNotebook(session)) return;
+  const s = session;
+  const area = $("notebook-text");
+
+  let samplerParams;
+  try {
+    samplerParams = collectParams();
+  } catch (e) {
+    setStatus(e.message, true);
+    return;
+  }
+
+  area.focus();
+  saveNotebook();
+  cancelOptions();
+  s.text = area.value;
+  nameNotebook(s);
+
+  const controller = new AbortController();
+  const gen = {
+    session: s,
+    controller,
+    start: area.selectionStart,
+    end: area.selectionEnd,
+    first: area.selectionStart,
+    firstEnd: area.selectionEnd,
+    pending: "",
+    output: "",
+    scrollTop: area.scrollTop,
+    follow: true,
+  };
+  state.generating = gen;
+  updateNotebookBar();
+  if (!step) setStatus("");
+
+  let finish = null;
+  let timings = null;
+  let error = null;
+  try {
+    const tokens = Number($("notebook-tokens").value);
+    const body = {
+      ...samplerParams,
+      prompt: s.text.slice(0, gen.start),
+      stream: true,
+      max_tokens: step ? STEP_MAX_TOKENS : tokens > 0 ? Math.round(tokens) : undefined,
+      stop_after_output: step || undefined,
+    };
+    const res = await api("/v1/completions", { method: "POST", body, signal: controller.signal });
+
+    for await (const data of sseData(res)) {
+      if (data === "[DONE]") break;
+
+      let chunk;
+      try {
+        chunk = JSON.parse(data);
+      } catch {
+        continue;
+      }
+      if (chunk.error) throw new Error(chunk.error.message || JSON.stringify(chunk.error));
+
+      const choice = chunk.choices?.[0];
+      if (choice?.text) addOutput(gen, choice.text);
+      if (choice?.finish_reason) finish = choice.finish_reason;
+      // The stop token ends the stream without being part of it. It belongs in
+      // the text: the context the next request sees has to include it, or a
+      // step that lands on it would have nothing to show and nothing to move
+      // past. A stop string is the client's own choice of where to end.
+      if (choice?.eos_reason === "stop_token" && choice.stop_str) addOutput(gen, choice.stop_str);
+      if (chunk.timings) timings = chunk.timings;
+    }
+  } catch (e) {
+    if (controller.signal.aborted) {
+      finish = "stopped";
+    } else {
+      error = e.message || String(e);
+      if (e.status === 401) openConnectionDialog();
+    }
+  } finally {
+    flushOutput(gen);
+    if (session === s) mergeOutputEdits(gen);
+    state.generating = null;
+    if (!s.deleted) persistSession(s);
+    updateComposer();
+    queueOptions(0);
+  }
+
+  if (error) {
+    setStatus(error, true);
+    return;
+  }
+  const usage = timings && {
+    completion_tokens: timings.predicted_n,
+    completion_tokens_per_sec: timings.predicted_per_second,
+    prompt_tokens: timings.prompt_n + timings.cache_n,
+    prompt_tokens_details: { cached_tokens: timings.cache_n },
+    prompt_tokens_per_sec: timings.prompt_per_second,
+  };
+  // Every step ends on its output limit, so that says nothing
+  setStatus(statsText({ usage, finish: step && finish === "length" ? null : finish }));
+}
+
+async function applyTemplate(messages, addGenerationPrompt) {
+  const chatParams = collectParams("chat");
+  const body = { messages, add_generation_prompt: addGenerationPrompt };
+  for (const key of TEMPLATE_PARAMS) if (key in chatParams) body[key] = chatParams[key];
+  return (await (await api("/v1/apply-template", { method: "POST", body })).json()).prompt;
+}
+
+async function startFromTemplate() {
+  const s = session;
+  const user = { role: "user", content: TEMPLATE_PLACEHOLDER_USER };
+
+  let text;
+  try {
+    try {
+      text = await applyTemplate([{ role: "system", content: TEMPLATE_PLACEHOLDER_SYSTEM }, user], true);
+    } catch {
+      // Not every template takes a system message
+      text = await applyTemplate([user], true);
+    }
+  } catch (e) {
+    setStatus(e.message, true);
+    return;
+  }
+  if (session !== s || s.text || state.generating) return;
+
+  const area = $("notebook-text");
+  area.focus();
+  s.text = text;
+  // Keeps its title: the first line of this text is template markup
+  if (s.title === NEW_NOTEBOOK_TITLE) s.title = "Notebook";
+  writeToEditor(0, area.value.length, text);
+
+  const placeholder = text.lastIndexOf(TEMPLATE_PLACEHOLDER_USER);
+  if (placeholder >= 0) area.setSelectionRange(placeholder, placeholder + TEMPLATE_PLACEHOLDER_USER.length);
+  persistSession(s);
+  updateNotebookBar();
+  setStatus("");
+}
+
+// Makes a new session from a chat and leaves the chat as it was, since the
+// messages can't be recovered from the text
+async function convertToNotebook(id) {
+  saveNotebook();
+  const generating = state.generating?.session.id === id ? state.generating.session : null;
+  const chat = generating || (id === session?.id ? session : load(`session.${id}`, null));
+  if (!chat) return;
+
+  const messages = [];
+  let images = 0;
+  if (chat.system?.trim()) messages.push({ role: "system", content: chat.system });
+  for (const m of chat.messages) {
+    if (m.role === "assistant" && !m.content) continue;
+    images += m.images?.length || 0;
+    messages.push({ role: m.role, content: m.content, ...(m.reasoning ? { reasoning_content: m.reasoning } : {}) });
+  }
+  if (!messages.length) {
+    setStatus("This chat has nothing to convert yet.");
+    return;
+  }
+
+  let text;
+  try {
+    // A chat waiting on the model ends ready for its reply
+    text = await applyTemplate(messages, messages.at(-1).role !== "assistant");
+  } catch (e) {
+    setStatus(e.message, true);
+    return;
+  }
+
+  showSession(createNotebook(chat.title, text));
+  $("notebook-text").focus();
+  setStatus(images ? `${images} image${images === 1 ? "" : "s"} left out: raw text can't carry them.` : "");
+}
+
+// ---------------------------------------------------------------------------
 // Sampling parameters
 
 function unescapeLine(line) {
@@ -1142,13 +1741,30 @@ function paramValue(spec, raw) {
   }
 }
 
-function collectParams() {
+// Which controls apply: a raw text session has no template, reasoning or
+// constraints, and sets its own token count
+function panelMode() {
+  return isNotebook(session) ? "raw" : "chat";
+}
+
+function inMode(spec, mode = panelMode()) {
+  return !spec.mode || spec.mode === mode;
+}
+
+function collectParams(mode = panelMode()) {
   const out = {};
   for (const [key, raw] of Object.entries(params)) {
     const spec = paramSpecs.get(key);
-    if (!spec) continue;
+    if (!spec || !inMode(spec, mode)) continue;
     const value = paramValue(spec, raw);
     if (value !== undefined) out[key] = value;
+  }
+  if (mode === "raw") {
+    for (const spec of paramSpecs.values()) {
+      if (spec.raw_default !== undefined && !(spec.key in out) && !serverDefault(spec).server) {
+        out[spec.key] = spec.raw_default;
+      }
+    }
   }
   return out;
 }
@@ -1164,7 +1780,8 @@ function serverDefault(spec) {
   if (override && "override" in override) {
     return { value: override.override, server: true, force: !!override.force };
   }
-  return { value: spec.default, server: false, force: false };
+  const value = panelMode() === "raw" ? (spec.raw_default ?? spec.default) : spec.default;
+  return { value, server: false, force: false };
 }
 
 function defaultLabel(spec) {
@@ -1306,8 +1923,8 @@ function renderParam(spec) {
 
 function updateGroupCounts() {
   for (const group of samplerGroups) {
-    const n = group.params.filter((p) => params[p.key] !== undefined).length;
-    group.countEl.textContent = n ? `${n} set` : "";
+    const n = group.params.filter((p) => inMode(p) && params[p.key] !== undefined).length;
+    if (group.countEl) group.countEl.textContent = n ? `${n} set` : "";
   }
 }
 
@@ -1315,14 +1932,19 @@ function renderParams() {
   const container = $("params");
   const openState = load("groups-open", {});
   container.replaceChildren();
+  state.panelMode = panelMode();
 
   for (const group of samplerGroups) {
+    group.countEl = null;
+    const shown = group.params.filter((p) => inMode(p));
+    if (!shown.length) continue;
+
     group.countEl = el("span", { class: "count" });
     const details = el(
       "details",
       { class: "param-group", open: openState[group.name] ?? group.open },
       el("summary", {}, group.name, group.countEl),
-      ...group.params.map(renderParam),
+      ...shown.map(renderParam),
     );
     details.addEventListener("toggle", () => {
       openState[group.name] = details.open;
@@ -1337,7 +1959,10 @@ async function loadSamplerSpecs() {
   const res = await fetch("samplers.json");
   samplerGroups = (await res.json()).groups;
   for (const group of samplerGroups) {
-    for (const spec of group.params) paramSpecs.set(spec.key, spec);
+    for (const spec of group.params) {
+      spec.mode ??= group.mode;
+      paramSpecs.set(spec.key, spec);
+    }
   }
 }
 
@@ -1371,6 +1996,7 @@ async function refreshOverrides() {
   $("preset-info").textContent = info.join(" ");
 
   renderParams();
+  invalidateOptions();
 }
 
 async function switchPreset() {
@@ -1386,26 +2012,10 @@ async function switchPreset() {
 }
 
 // ---------------------------------------------------------------------------
-// Models
+// Model
 
-// The model picked in the list, else the filter text taken as a path under
-// the model directory
-function listTarget() {
-  return state.selectedModel || $("model-filter").value.trim() || null;
-}
-
-// A model_name in the load options, which the server resolves when parsing.
-// Read approximately here, just to show the load target while typing.
-function optionsModelName() {
-  const text = $("load-options").value;
-  const match = /^model_name:\s*["']?(.+?)["']?\s*(#.*)?$/m.exec(text) || /"model_name"\s*:\s*"([^"]+)"/.exec(text);
-  return match ? match[1].trim() : null;
-}
-
-// What Load loads: a model_name in the load options, else the list target
-function modelLoadName() {
-  return optionsModelName() || listTarget();
-}
+// Models are loaded and unloaded on the status page; the chat shows which one
+// is loaded, and picks up a change made there through MODEL_CHANGED_KEY
 
 function trimPath(name) {
   return name.replace(/\/+$/, "");
@@ -1418,111 +2028,15 @@ function matchesLoadedPath(name) {
   return !!path && !!n && (path === n || path.endsWith("/" + n));
 }
 
-// Whether a name from the list, the recent paths or the filter is the loaded
-// model. A shorter name can match the end of the path by chance (a flat
-// "4.0bpw" folder vs "<model>/exl3/4.0bpw"), so the longest listed match wins.
-function isLoadedModel(name) {
-  if (!state.currentModel) return false;
-  if (!state.modelPath) return trimPath(name).split("/").pop() === state.currentModel.id;
-  return matchesLoadedPath(name) && (!state.loadedName || trimPath(name).length >= state.loadedName.length);
-}
-
-// ---- Load options, pre-filled with the settings that apply to the target
-
-const editedOptions = new Map();
-let optionsTarget = null;
-let optionsServerText = "";
-let optionsTimer = null;
-let optionsRequest = 0;
-
-function setOptionsNote(text, isError = false) {
-  const note = $("load-options-note");
-  note.textContent = text ? `· ${text}` : "";
-  note.classList.toggle("error", isError);
-}
-
-// Fill the load options for the current list target, keeping any edits made
-// for the previous one in case it's picked again
-function syncLoadOptions(force = false) {
-  const name = listTarget();
-  if (name === optionsTarget && !force) return;
-
-  const box = $("load-options");
-  if (optionsTarget && box.value !== optionsServerText) editedOptions.set(optionsTarget, box.value);
-  if (force) editedOptions.delete(name);
-
-  optionsTarget = name;
-  optionsServerText = "";
-  clearTimeout(optionsTimer);
-  const request = ++optionsRequest;
-
-  if (editedOptions.has(name)) {
-    box.value = editedOptions.get(name);
-    setOptionsNote("edited");
-    updateModelButtons();
-    return;
-  }
-
-  box.value = "";
-  setOptionsNote("");
-  updateModelButtons();
-  if (!name || state.permission !== "admin") return;
-
-  // Typed paths are looked up once typing pauses
-  const delay = name === state.selectedModel ? 0 : 350;
-  optionsTimer = setTimeout(async () => {
-    try {
-      const res = await api(`/v1/model/load_config?model_name=${encodeURIComponent(name)}`);
-      const data = await res.json();
-      if (request !== optionsRequest || box.value.trim()) return;
-      optionsServerText = data.yaml;
-      box.value = data.yaml;
-      setOptionsNote(data.has_tabby_config ? "tabby_config.yml" : "");
-      if (data.has_tabby_config) $("load-options-details").open = true;
-    } catch (e) {
-      // A path still being typed doesn't exist yet
-      if (request === optionsRequest && e.status !== 404) setOptionsNote(e.message, true);
-    }
-    updateModelButtons();
-  }, delay);
-}
-
-// The load options as a request body, parsed by the server so they can be YAML
-async function parseLoadOptions() {
-  const text = $("load-options").value;
-  if (!text.trim()) return {};
-  const res = await api("/v1/model/load_config/parse", { method: "POST", body: { yaml: text } });
-  return (await res.json()).settings;
-}
-
-function rememberModel(name) {
-  if (state.models.some((m) => m.id === name)) return;
-  recentModels = [name, ...recentModels.filter((n) => n !== name)].slice(0, 8);
-  save("recent-models", recentModels);
-}
-
-function updateModelButtons() {
-  const admin = state.permission === "admin";
-  const name = modelLoadName();
-  const isLoaded = !!name && isLoadedModel(name);
-  const loadButton = $("load-model");
-  loadButton.textContent = isLoaded ? "Reload" : "Load";
-  loadButton.disabled = !admin || state.loading || !name;
-  $("load-target").textContent = admin && name ? `Load target: ${name}` + (optionsModelName() ? " (from load options)" : "") : "";
-  $("unload-model").disabled = !admin || state.loading || !state.currentModel;
-}
-
 function renderModelInfo() {
   const info = $("model-info");
   const model = state.currentModel;
-  const dot = $("model-dot");
-  dot.className = "dot" + (state.loading ? " busy" : model ? " ok" : "");
-  $("topbar-model-name").textContent = state.loading
-    ? `Loading ${state.loading}…`
-    : state.loadedName || model?.id || "No model loaded";
+  $("model-dot").className = "dot" + (model ? " ok" : "");
+  $("topbar-model-name").textContent = state.loadedName || model?.id || "No model loaded";
 
   if (!model) {
     info.replaceChildren(el("div", { class: "muted" }, "No model loaded"));
+    updateNotebookBar();
     return;
   }
 
@@ -1540,87 +2054,7 @@ function renderModelInfo() {
     el("div", { class: "name" }, state.loadedName || model.id),
     el("dl", {}, rows.flatMap(([k, v]) => [el("dt", {}, k), el("dd", {}, String(v))])),
   );
-}
-
-function toggleFavorite(name) {
-  favoriteModels = favoriteModels.includes(name)
-    ? favoriteModels.filter((n) => n !== name)
-    : [...favoriteModels, name].sort((a, b) => a.localeCompare(b));
-  save("favorite-models", favoriteModels);
-  renderModelList();
-}
-
-function renderModelList() {
-  const list = $("model-list");
-  const filter = $("model-filter").value.trim().toLowerCase();
-  const admin = state.permission === "admin";
-  const byId = new Map(state.models.map((m) => [m.id, m]));
-  const favorites = new Set(favoriteModels);
-
-  // Favorites first (listed or not, so starred paths stay loadable), then
-  // recently loaded paths the list doesn't have, then the rest of the list
-  const models = [
-    ...(admin ? favoriteModels.map((id) => byId.get(id) || { id, unlisted: true }) : []),
-    ...(admin ? recentModels.filter((n) => !byId.has(n) && !favorites.has(n)).map((id) => ({ id, recent: true })) : []),
-    ...state.models.filter((m) => !favorites.has(m.id)),
-  ].filter((m) => !filter || m.id.toLowerCase().includes(filter));
-  list.replaceChildren();
-
-  for (const m of models) {
-    const item = el(
-      "li",
-      {
-        role: "option",
-        class: (m.id === state.selectedModel ? "selected " : "") + (isLoadedModel(m.id) ? "loaded" : ""),
-        "aria-selected": m.id === state.selectedModel ? "true" : "false",
-        title: m.meta?.n_ctx_train ? `${m.id} (trained context ${m.meta.n_ctx_train})` : m.id,
-        onclick: () => {
-          state.selectedModel = state.selectedModel === m.id ? null : m.id;
-          renderModelList();
-          syncLoadOptions();
-        },
-        ondblclick: () => {
-          state.selectedModel = m.id;
-          syncLoadOptions();
-          loadModel();
-        },
-      },
-      el("span", { class: "dot" }),
-      el("span", { class: "model-name" }, m.id),
-      m.recent ? el("span", { class: "tag" }, "recent") : null,
-      m.unlisted ? el("span", { class: "tag", title: "Not in the model list, loads as a path" }, "path") : null,
-    );
-
-    if (admin) {
-      const starred = favorites.has(m.id);
-      const star = el(
-        "button",
-        {
-          type: "button",
-          class: "star" + (starred ? " starred" : ""),
-          title: starred ? "Remove from favorites" : "Add to favorites",
-          "aria-label": starred ? `Remove ${m.id} from favorites` : `Add ${m.id} to favorites`,
-          "aria-pressed": starred ? "true" : "false",
-        },
-        icon("star"),
-      );
-      // The row selects on click and loads on double click; the star does neither
-      star.addEventListener("click", (e) => {
-        e.stopPropagation();
-        toggleFavorite(m.id);
-      });
-      star.addEventListener("dblclick", (e) => e.stopPropagation());
-      item.append(star);
-    }
-    list.append(item);
-  }
-
-  if (!models.length) {
-    let text = "No models found";
-    if (filter) text = "No match. Load takes the text above as a path under the model directory.";
-    else if (state.permission && state.permission !== "admin") text = "An admin key is needed to list models.";
-    list.append(el("li", { class: "empty" }, text));
-  }
+  updateNotebookBar();
 }
 
 async function refreshModels() {
@@ -1629,101 +2063,32 @@ async function refreshModels() {
   } catch {
     state.currentModel = null;
   }
+  invalidateOptions();
 
-  // The model card only names the folder; /props has the full path
+  // The model card only names the folder; /props has the full path, and the
+  // model list (admin only) its name under the model directory
   state.modelPath = null;
+  state.loadedName = null;
   if (state.currentModel) {
     try {
       state.modelPath = trimPath((await (await api("/props")).json()).model_path || "") || null;
     } catch {
-      // Fall back to matching on the folder name
+      // Fall back to the folder name
     }
   }
 
-  try {
-    const data = await (await api("/v1/model/list")).json();
-    state.models = (data.data || []).sort((a, b) => a.id.localeCompare(b.id));
-  } catch (e) {
-    state.models = [];
-    $("model-message").textContent = e.message;
+  if (state.modelPath && state.permission === "admin") {
+    let listed = [];
+    try {
+      listed = ((await (await api("/v1/model/list")).json()).data || []).map((m) => m.id);
+    } catch {
+      // Show the folder name
+    }
+    const candidates = [...load("favorite-models", []), ...load("recent-models", []), ...listed].map(trimPath);
+    state.loadedName = candidates.filter(matchesLoadedPath).sort((a, b) => b.length - a.length)[0] || null;
   }
-
-  const candidates = [...favoriteModels, ...recentModels, ...state.models.map((m) => m.id)].map(trimPath);
-  state.loadedName = candidates.filter(matchesLoadedPath).sort((a, b) => b.length - a.length)[0] || null;
 
   renderModelInfo();
-  renderModelList();
-  updateModelButtons();
-}
-
-async function loadModel() {
-  if (!modelLoadName() || state.loading) return;
-
-  const message = $("model-message");
-  let options;
-  try {
-    options = await parseLoadOptions();
-  } catch (e) {
-    message.textContent = e.message.startsWith("Load options") ? e.message : `Load options: ${e.message}`;
-    message.classList.add("error");
-    return;
-  }
-
-  const named = typeof options.model_name === "string" ? options.model_name.trim() : "";
-  const name = named || listTarget();
-  if (!name) return;
-
-  const bar = $("load-progress");
-  message.classList.remove("error");
-  message.textContent = "";
-  state.loading = name;
-  bar.hidden = false;
-  bar.firstElementChild.style.width = "0";
-  renderModelInfo();
-  updateModelButtons();
-
-  try {
-    // Loading the model that is already loaded is a no-op, so a reload with
-    // different options needs an unload first
-    if (isLoadedModel(name)) {
-      message.textContent = "Unloading…";
-      await api("/v1/model/unload", { method: "POST" });
-    }
-
-    const res = await api("/v1/model/load", { method: "POST", body: { ...options, model_name: name } });
-    for await (const data of sseData(res)) {
-      const event = JSON.parse(data);
-      if (event.error) throw new Error(event.error.message);
-      const label = event.model_type === "model" ? "model" : `${event.model_type} model`;
-      message.textContent = `Loading ${label}: ${event.module} / ${event.modules} modules`;
-      bar.firstElementChild.style.width = `${(100 * event.module) / event.modules}%`;
-    }
-    message.textContent = `Loaded ${name}`;
-    rememberModel(name);
-  } catch (e) {
-    message.textContent = e.message;
-    message.classList.add("error");
-  } finally {
-    state.loading = false;
-    bar.hidden = true;
-    await refreshModels();
-    await refreshOverrides();
-  }
-}
-
-async function unloadModel() {
-  if (!state.currentModel || state.loading) return;
-  const message = $("model-message");
-  message.classList.remove("error");
-  try {
-    await api("/v1/model/unload", { method: "POST" });
-    message.textContent = "Model unloaded";
-  } catch (e) {
-    message.textContent = e.message;
-    message.classList.add("error");
-  }
-  await refreshModels();
-  await refreshOverrides();
 }
 
 // ---------------------------------------------------------------------------
@@ -1761,11 +2126,10 @@ async function connect() {
     openConnectionDialog(
       result.status === 401 ? "The server needs an API key." : `Could not reach the server: ${result.message}`,
     );
-  } else if (state.permission !== "admin") {
-    $("model-message").textContent = "This key can chat but not list or load models. Use the admin key for that.";
-  } else {
-    $("model-message").textContent = "";
   }
+  // Models are loaded on the status page, which shows only the live status
+  // without the admin key
+  $("status-link").textContent = state.permission === "admin" ? "Load models and view server status" : "View server status";
   await Promise.all([refreshModels(), refreshOverrides()]);
 }
 
@@ -1829,6 +2193,7 @@ function applySidePanels() {
 
 function bindEvents() {
   $("new-chat").addEventListener("click", newChat);
+  $("new-notebook").addEventListener("click", newNotebook);
 
   $("messages").addEventListener("click", async (e) => {
     const button = e.target.closest(".code-copy");
@@ -1870,7 +2235,7 @@ function bindEvents() {
   let dragDepth = 0;
   const carriesFiles = (e) => e.dataTransfer?.types.includes("Files");
   document.addEventListener("dragenter", (e) => {
-    if (!carriesFiles(e)) return;
+    if (!carriesFiles(e) || isNotebook(session)) return;
     e.preventDefault();
     dragDepth++;
     $("drop-overlay").hidden = false;
@@ -1889,7 +2254,8 @@ function bindEvents() {
     e.preventDefault();
     dragDepth = 0;
     $("drop-overlay").hidden = true;
-    addAttachments([...e.dataTransfer.files]);
+    if (isNotebook(session)) setStatus("Raw text sessions can't take images.", true);
+    else addAttachments([...e.dataTransfer.files]);
   });
 
   $("image-viewer").addEventListener("click", () => $("image-viewer").close());
@@ -1898,7 +2264,41 @@ function bindEvents() {
   $("regenerate").addEventListener("click", regenerate);
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape" && state.generating && !$("connection-dialog").open) state.generating.controller.abort();
+
+    // Holding down Ctrl+Enter keeps stepping, once for each step finished
+    if (e.key === "Enter" && (e.ctrlKey || e.metaKey) && isNotebook(session) && !$("connection-dialog").open) {
+      e.preventDefault();
+      if (!e.shiftKey) sample(true);
+      else if (!e.repeat) sample(false);
+    }
   });
+
+  // On the parent, as the textarea gets replaced
+  const editor = document.querySelector(".notebook-editor");
+  editor.addEventListener("beforeinput", (e) => {
+    // Output goes in at a tracked position, which editing would throw off
+    const gen = state.generating;
+    if (gen?.session === session && !gen.inserting) e.preventDefault();
+  });
+  editor.addEventListener("input", () => {
+    if (state.generating?.inserting) return;
+    session.text = $("notebook-text").value;
+    updateNotebookBar();
+    queueNotebookSave(session);
+    queueOptions();
+  });
+  document.addEventListener("selectionchange", () => {
+    if (document.activeElement === $("notebook-text")) queueOptions();
+  });
+  $("params").addEventListener("input", () => queueOptions());
+  $("params").addEventListener("change", () => queueOptions());
+  $("notebook-options-toggle").addEventListener("click", toggleOptionsPanel);
+  $("notebook-step").addEventListener("click", () => sample(true));
+  $("notebook-run").addEventListener("click", () => sample(false));
+  $("notebook-stop").addEventListener("click", () => state.generating?.controller.abort());
+  $("notebook-template").addEventListener("click", startFromTemplate);
+  $("notebook-tokens").addEventListener("change", () => save("notebook-tokens", $("notebook-tokens").value));
+  window.addEventListener("pagehide", saveNotebook);
 
   $("system-prompt").addEventListener("input", () => {
     session.system = $("system-prompt").value;
@@ -1910,26 +2310,16 @@ function bindEvents() {
     refreshModels();
     refreshOverrides();
   });
-  $("model-filter").addEventListener("input", () => {
-    // A selection the filter hides would otherwise beat the typed path
-    const filter = $("model-filter").value.trim().toLowerCase();
-    if (state.selectedModel && !state.selectedModel.toLowerCase().includes(filter)) state.selectedModel = null;
-    renderModelList();
-    syncLoadOptions();
-  });
-  $("load-options").addEventListener("input", () => {
-    setOptionsNote($("load-options").value !== optionsServerText ? "edited" : "");
-    updateModelButtons();
-  });
-  $("reset-load-options").addEventListener("click", () => syncLoadOptions(true));
-  $("load-model").addEventListener("click", loadModel);
-  $("unload-model").addEventListener("click", unloadModel);
   $("preset-select").addEventListener("change", switchPreset);
 
+  // Settings for the other kind of session aren't on show, so they stay
   $("reset-params").addEventListener("click", () => {
-    params = {};
+    for (const key of Object.keys(params)) {
+      if (!paramSpecs.has(key) || inMode(paramSpecs.get(key))) delete params[key];
+    }
     save("params", params);
     renderParams();
+    queueOptions();
   });
 
   $("open-connection").addEventListener("click", () => openConnectionDialog());
@@ -1947,7 +2337,7 @@ function bindEvents() {
     settings.markdown = !settings.markdown;
     save("settings", settings);
     applyFormatting();
-    renderThread();
+    if (!isNotebook(session)) renderThread();
   });
 
   $("theme-select").addEventListener("change", () => {
@@ -1962,11 +2352,15 @@ function bindEvents() {
   for (const side of Object.values(SIDE_PANELS)) side.drawer.addEventListener("change", applySidePanels);
   $("scrim").addEventListener("click", closeDrawers);
 
-  // Another tab may have changed the chats; pick up the session list
+  // Another tab may have changed the chats; pick up the session list. The
+  // status page announces model loads and unloads the same way
   window.addEventListener("storage", (e) => {
     if (e.key === STORE + "sessions") {
       sessionIndex = load("sessions", []);
       renderSessionList();
+    } else if (e.key === STORE + MODEL_CHANGED_KEY) {
+      refreshModels();
+      refreshOverrides();
     }
   });
 }
@@ -1974,21 +2368,8 @@ function bindEvents() {
 // ---------------------------------------------------------------------------
 // Startup
 
-// The server prints a link to the client with the admin key in the URL
-// fragment, which the browser never sends to the server. Take the key from
-// it, then clear it from the address bar.
-function takeKeyFromLink() {
-  const key = new URLSearchParams(location.hash.slice(1)).get("key");
-  if (!key) return;
-
-  // The link is for the server that printed it, not one set up earlier
-  settings.baseUrl = "";
-  settings.apiKey = key;
-  save("settings", settings);
-  history.replaceState(null, "", location.pathname + location.search);
-}
-
 async function init() {
+  onStorageError((e) => setStatus(`Could not save to browser storage (${e.name}). Delete some chats to free space.`, true));
   takeKeyFromLink();
   renderThemeMenu();
   applyTheme();
@@ -1996,12 +2377,11 @@ async function init() {
   applySidePanels();
   bindEvents();
 
+  $("notebook-tokens").value = load("notebook-tokens", DEFAULT_NOTEBOOK_TOKENS);
+
   const current = load("current", null);
   if (!(current && openSession(current)) && !(sessionIndex.length && openSession(sessionIndex[0].id))) {
-    session = createSession();
-    save("current", session.id);
-    renderSessionList();
-    renderThread();
+    showSession(createSession());
   }
 
   try {
@@ -2012,7 +2392,7 @@ async function init() {
   renderParams();
 
   await connect();
-  $("input").focus();
+  $(isNotebook(session) ? "notebook-text" : "input").focus();
   collectImages();
 }
 

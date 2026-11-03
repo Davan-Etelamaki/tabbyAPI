@@ -15,6 +15,8 @@ from common.errors import (
     ContextLengthExceededError,
     ContextLengthHTTPException,
     GrammarParseError,
+    LoopDetectedError,
+    LoopDetectedHTTPException,
 )
 from common.logger import xlogger
 from typing import List, Optional
@@ -23,6 +25,7 @@ from common import model
 from common.networking import (
     get_context_length_generator_error,
     get_generator_error,
+    get_loop_detected_generator_error,
     handle_request_error,
     request_tag,
     DisconnectHandler,
@@ -32,6 +35,8 @@ from endpoints.OAI.types.completion import (
     CompletionRequest,
     CompletionResponse,
     CompletionRespChoice,
+    ContinuationsRequest,
+    ContinuationsResponse,
     chat_logprobs_to_completion_logprobs,
 )
 from endpoints.OAI.types.common import Timings, UsageStats
@@ -77,6 +82,7 @@ def _compose_response(
                 index=generation.get("index"),
                 finish_reason=generation.get("finish_reason", "stop"),
                 eos_reason=generation.get("eos_reason"),
+                stop_str=generation.get("stop_str"),
                 logprobs=logprobs,
                 text=generation.get("content"),
             )
@@ -122,6 +128,8 @@ def _compose_serialize_stream_chunk(
     }
     if not suppress_finish and finish_reason and generation.get("eos_reason"):
         choice["eos_reason"] = generation["eos_reason"]
+        if generation.get("stop_str"):
+            choice["stop_str"] = generation["stop_str"]
 
     if logprobs:
         choice["logprobs"] = chat_logprobs_to_completion_logprobs(logprobs).model_dump()
@@ -314,7 +322,6 @@ async def stream_generate_completion(
                 idx = p_idx * data.n + n_idx
 
                 task_gen_params = data.model_copy(deep=True)
-                task_gen_params.max_tokens += idx * 5
                 request_id = _parse_gen_request_id(total_n, request.state.id, idx)
 
                 gen_task = asyncio.create_task(
@@ -392,9 +399,49 @@ async def stream_generate_completion(
     except GrammarParseError as exc:
         yield get_generator_error(str(exc), exc_info=False)
 
+    except LoopDetectedError as exc:
+        yield get_loop_detected_generator_error(str(exc))
+
     except Exception as e:
         xlogger.error("Error during completion", str(e), details=f"\n{str(e)}")
         yield get_generator_error("Completion aborted. Please check the server console.")
+
+    finally:
+        await disconnect_handler.cleanup()
+
+
+async def generate_continuations(
+    data: ContinuationsRequest,
+    request: Request,
+    disconnect_handler: DisconnectHandler,
+) -> ContinuationsResponse:
+    """The ways a prompt can go on from here, with no one path chosen."""
+
+    try:
+        result = await model.container.explore_continuations(
+            request.state.id,
+            data.prompt,
+            data,
+            data.max_options,
+            data.max_branch_tokens,
+            disconnect_handler,
+            label=_gen_label(request, "continuations", 1, 0, False),
+        )
+        return ContinuationsResponse(**result)
+
+    except CancelledError:
+        raise
+
+    except ContextLengthExceededError as exc:
+        error_message = handle_request_error(str(exc), exc_info=False).error.message
+        raise ContextLengthHTTPException(error_message) from exc
+
+    except Exception as exc:
+        error_message = handle_request_error(
+            f"{request_tag(request)} continuations aborted. Maybe the model was unloaded? "
+            "Please check the server console."
+        ).error.message
+        raise HTTPException(503, error_message) from exc
 
     finally:
         await disconnect_handler.cleanup()
@@ -473,6 +520,10 @@ async def generate_completion(
     except GrammarParseError as exc:
         error_message = handle_request_error(str(exc), exc_info=False).error.message
         raise HTTPException(400, error_message) from exc
+
+    except LoopDetectedError as exc:
+        error_message = handle_request_error(str(exc), exc_info=False).error.message
+        raise LoopDetectedHTTPException(error_message) from exc
 
     except Exception as exc:
         error_message = handle_request_error(

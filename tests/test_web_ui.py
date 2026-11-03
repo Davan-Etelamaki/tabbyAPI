@@ -2,6 +2,7 @@
 panel keeps up with the sampler params the server supports."""
 
 import json
+import re
 
 from fastapi.testclient import TestClient
 from loguru import logger
@@ -23,8 +24,6 @@ NOT_IN_PANEL = {
     "mirostat_eta",
     # llama.cpp spelling of dry_range, which the panel has
     "dry_penalty_last_n",
-    # Chat completions take BOS handling from the template
-    "add_bos_token",
     # The client doesn't display logprobs
     "logprobs",
     "top_logprobs",
@@ -48,6 +47,30 @@ def test_panel_keys_are_request_fields():
 
     unknown = set(keys) - set(ChatCompletionRequest.model_fields)
     assert not unknown, f"not chat completion request fields: {sorted(unknown)}"
+
+
+def test_panel_modes():
+    groups = json.loads((STATIC_DIR / "samplers.json").read_text(encoding="utf8"))["groups"]
+    for item in [*groups, *(param for group in groups for param in group["params"])]:
+        assert item.get("mode") in (None, "chat", "raw"), item
+
+    # Raw text sessions have no template, and set their own token count
+    chat_only = {group["name"] for group in groups if group.get("mode") == "chat"}
+    assert chat_only == {"Constraints", "Reasoning", "Template"}
+    params = {param["key"]: param for group in groups for param in group["params"]}
+    assert params["max_tokens"]["mode"] == "chat"
+    # BOS comes from the template in a chat, and from this in raw text
+    assert params["add_bos_token"]["mode"] == "raw"
+    # Raw text is often cut off in the middle of a word
+    assert params["token_healing"]["default"] is False
+    assert params["token_healing"]["raw_default"] is True
+
+
+def test_notebook_controls_exist():
+    page = (STATIC_DIR / "index.html").read_text(encoding="utf8")
+    script = (STATIC_DIR / "app.js").read_text(encoding="utf8")
+    for control in re.findall(r'\$\("(notebook-[a-z-]+|new-notebook)"\)', script):
+        assert f'id="{control}"' in page, control
 
 
 def test_ui_served(monkeypatch):
@@ -74,6 +97,24 @@ def test_ui_served(monkeypatch):
     for package in ("markdown-it", "entities", "linkify-it", "mdurl", "punycode.js", "uc.micro"):
         assert package in license_text, package
 
+    # So do the code highlighter and the math typesetter the client loads when
+    # a reply needs them, with every file it asks for
+    app_js = client.get("/ui/app.js").text
+    for path in (
+        "vendor/highlight.js/highlight.min.js",
+        "vendor/katex/katex.min.js",
+        "vendor/katex/katex.min.css",
+    ):
+        assert path in app_js, path
+        assert client.get(f"/ui/{path}").status_code == 200, path
+    for language in ("dockerfile", "powershell", "cmake", "latex"):
+        assert client.get(f"/ui/vendor/highlight.js/languages/{language}.min.js").status_code == 200
+    assert "BSD 3-Clause" in client.get("/ui/vendor/highlight.js/LICENSE.txt").text
+    assert "MIT" in client.get("/ui/vendor/katex/LICENSE.txt").text
+    katex_css = client.get("/ui/vendor/katex/katex.min.css").text
+    for font in set(re.findall(r"url\((fonts/[^)]+\.woff2)\)", katex_css)):
+        assert client.get(f"/ui/vendor/katex/{font}").status_code == 200, font
+
     # Not part of the API schema
     assert not any(path.startswith("/ui") for path in client.get("/openapi.json").json()["paths"])
 
@@ -97,16 +138,22 @@ def startup_lines(monkeypatch, admin_key, disable_auth):
         setup_app("127.0.0.1", 5000)
     finally:
         logger.remove(sink)
-    return [line for line in lines if line.startswith("Chat client at")]
+    return [line for line in lines if line.startswith(("Chat client at", "Server status"))]
 
 
 def test_startup_link_carries_admin_key(monkeypatch):
     # In the fragment, so the browser never sends it; quoted, since a
     # hand-written key can hold any characters
     lines = startup_lines(monkeypatch, "se/cret key", disable_auth=False)
-    assert lines == ["Chat client at http://127.0.0.1:5000/ui/#key=se%2Fcret%20key\n"]
+    assert lines == [
+        "Chat client at http://127.0.0.1:5000/ui/#key=se%2Fcret%20key\n",
+        "Server status and model loading at http://127.0.0.1:5000/ui/status#key=se%2Fcret%20key\n",
+    ]
 
 
 def test_startup_link_without_auth(monkeypatch):
     lines = startup_lines(monkeypatch, "secret", disable_auth=True)
-    assert lines == ["Chat client at http://127.0.0.1:5000/ui/\n"]
+    assert lines == [
+        "Chat client at http://127.0.0.1:5000/ui/\n",
+        "Server status and model loading at http://127.0.0.1:5000/ui/status\n",
+    ]

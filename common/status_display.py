@@ -11,7 +11,7 @@ import time
 from collections import deque
 from io import StringIO
 from dataclasses import dataclass, field
-from typing import Callable, Optional
+from typing import Awaitable, Callable, Optional
 
 from rich.console import Console, Group
 from rich.progress_bar import ProgressBar
@@ -26,6 +26,9 @@ SPEED_WINDOW = 2.0
 
 HEIGHT_HOLD = 5.0
 
+# Finished requests the status page lists, with their text
+RECENT_JOBS = 20
+
 
 @dataclass
 class JobStatus:
@@ -39,20 +42,57 @@ class JobStatus:
     gen_tokens: int = 0
     created: float = field(default_factory=time.monotonic)
     samples: deque = field(default_factory=deque)
+    first_generated: float = 0.0
+    last_generated: float = 0.0
+    # Context restored when the engine takes the job back after a requeue
+    resume_tokens: int = 0
+    resume_total: int = 0
     # Called after every state change so the display can redraw promptly
     on_change: Optional[Callable[[], None]] = None
+    # Whether the engine has put the job back in its queue. A long generation
+    # gives up its cache pages every max_rq_tokens and waits there until there
+    # is room to continue, which can take a while when the cache is full
+    is_waiting: Optional[Callable[[], bool]] = None
+    # For the status page: the prompt and the text generated so far, kept as
+    # chunks and joined when read
+    request_id: str = ""
+    prompt: str = ""
+    chunks: list = field(default_factory=list)
+    text_length: int = 0
+    finish_reason: Optional[str] = None
+    finished: Optional[float] = None
+    # Ends the job from outside its request (the status page). The backend
+    # finishes the response with what was generated, as finish_reason "abort"
+    cancel: Optional[Callable[[], Awaitable[None]]] = None
+    cancel_requested: bool = False
 
     def _changed(self):
         if self.on_change is not None:
             self.on_change()
 
     def started(self, cached_tokens: int):
+        if self.gen_tokens:
+            # Taken back after a requeue: the context so far is restored from
+            # the cache, or prefilled again where it was evicted
+            self.stage = "resuming"
+            self.resume_tokens = 0
+            self.resume_total = 0
+            self.samples.clear()
+            self._changed()
+            return
+
         self.stage = "prefill"
         self.cached_tokens = cached_tokens
         self.prefill_tokens = cached_tokens
         self._changed()
 
-    def prefill(self, progress: int):
+    def prefill(self, progress: int, total: int = 0):
+        if self.stage == "resuming":
+            self.resume_tokens = max(self.resume_tokens, progress)
+            self.resume_total = max(self.resume_total, total)
+            self._changed()
+            return
+
         self.stage = "prefill"
         self.prefill_tokens = max(self.prefill_tokens, progress)
         self._changed()
@@ -63,13 +103,68 @@ class JobStatus:
         self.gen_tokens = gen_tokens
 
         now = time.monotonic()
+        self.first_generated = self.first_generated or now
+        self.last_generated = now
         self.samples.append((now, gen_tokens))
         while self.samples and now - self.samples[0][0] > SPEED_WINDOW:
             self.samples.popleft()
         self._changed()
 
+    def append_text(self, text: str):
+        self.chunks.append(text)
+        self.text_length += len(text)
+
+    def text(self, offset: int = 0) -> str:
+        """The generated text from offset on."""
+
+        if len(self.chunks) > 1:
+            self.chunks[:] = ["".join(self.chunks)]
+        return self.chunks[0][offset:] if self.chunks else ""
+
+    def info(self, now: float) -> dict:
+        """A summary for the status page."""
+
+        waiting = self.waiting()
+        end = self.finished if self.finished is not None else now
+        return {
+            "request_id": self.request_id,
+            "label": self.label,
+            "stage": "finished"
+            if self.finished is not None
+            else ("waiting" if waiting else self.stage),
+            "prompt_tokens": self.prompt_tokens,
+            "cached_tokens": self.cached_tokens,
+            "prefill_tokens": self.prefill_tokens,
+            "gen_tokens": self.gen_tokens,
+            "resume_tokens": self.resume_tokens,
+            "resume_total": self.resume_total,
+            "tokens_per_second": None if self.finished is not None else self.tokens_per_second(),
+            "duration": end - self.created,
+            "waiting_for": now - self.last_generated if waiting else None,
+            "text_length": self.text_length,
+            "finish_reason": self.finish_reason,
+            "can_cancel": self.finished is None
+            and self.cancel is not None
+            and not self.cancel_requested,
+        }
+
+    def waiting(self) -> bool:
+        """Whether a job that has started generating is back in the engine's queue."""
+
+        if self.stage != "generating" or self.is_waiting is None:
+            return False
+        try:
+            return self.is_waiting()
+        except Exception:
+            return False
+
+    def generating_seconds(self) -> float:
+        return self.last_generated - self.first_generated
+
     def tokens_per_second(self) -> Optional[float]:
-        if len(self.samples) < 2:
+        # Samples are only pruned when a new one arrives, so a job that stopped
+        # getting tokens would keep showing its last rate
+        if len(self.samples) < 2 or time.monotonic() - self.samples[-1][0] > SPEED_WINDOW:
             return None
 
         (t0, n0), (t1, n1) = self.samples[0], self.samples[-1]
@@ -80,6 +175,11 @@ class StatusDisplay:
     def __init__(self):
         self.jobs: dict[str, JobStatus] = {}
         self.completed = 0
+        # Finished jobs, newest first, and the tokens finished jobs processed
+        self.recent: deque = deque(maxlen=RECENT_JOBS)
+        self.done_gen_tokens = 0
+        self.done_gen_seconds = 0.0
+        self.done_prefill_tokens = 0
         self._live = None
         self._task: Optional[asyncio.Task] = None
         self._last_frame: Optional[str] = None
@@ -193,15 +293,51 @@ class StatusDisplay:
     # Job tracking, called from the generation loop
 
     def add_job(self, request_id: str, label: str, prompt_tokens: int) -> JobStatus:
-        status = JobStatus(label=label, prompt_tokens=prompt_tokens, on_change=self.refresh)
+        status = JobStatus(
+            label=label, prompt_tokens=prompt_tokens, on_change=self.refresh, request_id=request_id
+        )
         self.jobs[request_id] = status
         self.refresh()
         return status
 
     def remove_job(self, request_id: str):
-        if self.jobs.pop(request_id, None) is not None:
+        job = self.jobs.pop(request_id, None)
+        if job is not None:
             self.completed += 1
+            self.done_gen_tokens += job.gen_tokens
+            self.done_gen_seconds += job.generating_seconds()
+            self.done_prefill_tokens += max(job.prefill_tokens - job.cached_tokens, 0)
+            job.finished = time.monotonic()
+            job.cancel = None
+            job.is_waiting = None
+            self.recent.appendleft(job)
             self.refresh()
+
+    def find_job(self, request_id: str) -> Optional[JobStatus]:
+        """An active job, or a recently finished one."""
+
+        job = self.jobs.get(request_id)
+        if job is None:
+            job = next((j for j in self.recent if j.request_id == request_id), None)
+        return job
+
+    def snapshot(self) -> dict:
+        """Jobs, cache statistics and token counters, for the status page."""
+
+        now = time.monotonic()
+        active = list(self.jobs.values())
+        return {
+            "jobs": [job.info(now) for job in active],
+            "recent": [job.info(now) for job in self.recent],
+            "completed": self.completed,
+            # Totals since startup. A client takes rates from the change between polls
+            "generated_tokens": self.done_gen_tokens + sum(job.gen_tokens for job in active),
+            "generated_seconds": self.done_gen_seconds
+            + sum(job.generating_seconds() for job in active),
+            "prefilled_tokens": self.done_prefill_tokens
+            + sum(max(job.prefill_tokens - job.cached_tokens, 0) for job in active),
+            "cache": self._cache_stats(),
+        }
 
     # Rendering
 
@@ -295,6 +431,22 @@ class StatusDisplay:
             if job.cached_tokens:
                 detail.append(f" ({job.cached_tokens:,} cached)", style="dim")
             return label, Text("prefill"), bar, detail
+
+        if job.stage == "resuming":
+            bar = ProgressBar(total=max(job.resume_total, 1), completed=job.resume_tokens, width=24)
+            detail = Text(f"{job.gen_tokens:,} tokens")
+            if job.resume_total:
+                detail.append(f" · context {job.resume_tokens:,}/{job.resume_total:,}", style="dim")
+            return label, Text("resuming"), bar, detail
+
+        if job.waiting():
+            detail = Text(f"{job.gen_tokens:,} tokens")
+            waited = int(time.monotonic() - job.last_generated)
+            detail.append(
+                f" · requeued, waiting {waited // 60}:{waited % 60:02d}",
+                style="dim",
+            )
+            return label, Text("waiting", style="yellow"), Text(""), detail
 
         detail = Text(f"{job.gen_tokens:,} tokens")
         tps = job.tokens_per_second()

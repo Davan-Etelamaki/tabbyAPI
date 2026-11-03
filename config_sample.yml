@@ -50,9 +50,15 @@ network:
   # Generation requests are already logged in detail; this adds the rest, such as model list and health polls.
   access_log: false
 
-  # Serve the built-in chat client at /ui (default: True).
-  # A static page for testing models and settings; it only uses the
-  # regular API, so it does nothing until a browser opens it.
+  # Serve a Prometheus-compatible /metrics endpoint (default: False).
+  # Metric names follow llama.cpp's under a tabbyapi: prefix, and the token counters move
+  # during a generation. Requires an API key unless disable_auth is set.
+  enable_metrics: false
+
+  # Serve the built-in chat client at /ui and the status page at
+  # /ui/status (default: True). Static pages for testing models and
+  # settings, loading models and watching the server; they only use
+  # the regular API, so they do nothing until a browser opens them.
   web_ui: true
 
 # Options for logging
@@ -74,6 +80,12 @@ logging:
   # Prefix console log lines with the time of day (default: True).
   # The log files under logs/ always carry full timestamps.
   log_timestamps: true
+
+  # Print the API and admin keys to the console at startup (default: True).
+  # Set to false to log only how many keys api_tokens.yml holds, for consoles or log
+  # files that others can read. The web UI links printed at startup then leave out the
+  # admin key as well.
+  log_auth_keys: true
 
   # Write every /v1/chat/completions request to logs/debug/ as JSON (default: False).
   # Also saves the fully templated prompt (the exact text sent to the tokenizer)
@@ -415,6 +427,18 @@ draft_model:
   # Longer values advance more tokens at prefill speed on a hit, and cost a wider
   # verification pass.
   hybrid_draft_tokens: 0
+
+  # Ceiling on the decoding rows of a speculative round, batch size times (1 + draft tokens)
+  # (default: 0, no ceiling). The draft window shrinks as the batch grows so that verifying
+  # drafts doesn't cost more than drafting saves at high concurrency.
+  draft_max_rows: 0
+
+  # Draft through a dynamic sparse LM head of this many vocabulary columns (default: 0, full
+  # head). Cuts draft latency for MTP and DFlash drafters, which share the target's head;
+  # verification keeps the full head so output is unaffected. The column set follows the token
+  # frequencies seen in prompts and generations, saved per tokenizer under the user cache
+  # directory. Layer-split loads only; ignored with tensor parallelism.
+  sparse_draft_head: 0
 
 # Options for Sampling
 sampling:
