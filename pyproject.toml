@@ -6,9 +6,54 @@ requires = [
 ]
 build-backend = "setuptools.build_meta"
 
-# We're not building the project itself
+# The application IS the artifact: `main`/`start`, the served packages and the two
+# runtime data directories. Upstream declared `py-modules = []` ("we're not building
+# the project itself"), which left the checkout as the runtime with no console script,
+# forcing the launcher to `cd` into the tree and run `python main.py`. See
+# common/paths.py. No package has `__init__.py`, so discovery must be namespace-based;
+# `tools/` holds standalone dev scripts and stays out of the runtime.
 [tool.setuptools]
-py-modules = []
+py-modules = ["main", "start"]
+
+[tool.setuptools.packages.find]
+include = ["common*", "backends*", "endpoints*", "templates*", "sampler_overrides*"]
+namespaces = true
+
+[tool.setuptools.package-data]
+# Every non-python file the served app reads: chat templates, sampler presets,
+# the web UI (html/css/js) and its vendored katex fonts. `tests` and `tools` are
+# excluded above, so their files never reach the runtime.
+"*" = [
+    "*.jinja",
+    "*.yml",
+    "*.yaml",
+    "*.json",
+    "*.html",
+    "*.css",
+    "*.js",
+    "*.txt",
+    "*.md",
+    "*.woff",
+    "*.woff2",
+    "*.ttf",
+    "*.svg",
+    "*.png",
+    "*.ico",
+    "*.map",
+    "*.license",
+]
+
+# `vendor/highlight.js` contains a dot, so package discovery (which requires valid
+# module identifiers) skips that directory and its files would be lost. Attach them
+# to the parent package instead.
+"endpoints.ui.static.vendor" = [
+    "highlight.js/*.js",
+    "highlight.js/*.txt",
+    "highlight.js/languages/*.js",
+]
+
+[project.scripts]
+tabbyAPI = "main:entrypoint"
 
 [project]
 name = "tabbyAPI"
