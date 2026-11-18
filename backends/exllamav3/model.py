@@ -38,6 +38,7 @@ from backends.exllamav3.sampler import (
 from backends.exllamav3.utils import exllama_supports_nccl
 from backends.exllamav3.vision import clear_image_embedding_cache, image_embedding_cache
 from common.concurrency import iterate_in_threadpool
+from common.paths import runtime_path
 from common.gen_logging import (
     format_settings,
     log_generation_params,
@@ -238,7 +239,7 @@ class ExllamaV3Container:
     """Model container for the ExLlamaV3 backend."""
 
     # Exposed model information
-    model_dir: pathlib.Path = pathlib.Path("models")
+    model_dir: pathlib.Path = runtime_path("models")
     draft_model_dir: Optional[pathlib.Path] = None
     prompt_template: Optional[PromptTemplate] = None
     tool_format: Optional[str] = None

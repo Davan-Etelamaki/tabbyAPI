@@ -15,6 +15,7 @@ APP_ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 TEMPLATES_DIR = APP_ROOT / "templates"
 LOGS_DIR = APP_ROOT / "logs"
+SAMPLER_OVERRIDES_DIR = APP_ROOT / "sampler_overrides"
 
 
 def runtime_path(path) -> pathlib.Path:

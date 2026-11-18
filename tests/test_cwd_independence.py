@@ -11,6 +11,7 @@ became an unlinked inode.
 import json
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import tempfile
@@ -192,28 +193,36 @@ def test_relative_config_paths_anchor_to_the_app(relative):
     assert runtime_path("/srv/models") == pathlib.Path("/srv/models")
 
 
-def test_no_relative_resource_literal_remains_in_served_code():
-    """Guards the class, not one instance: these literals are how the bug returns.
+def test_no_relative_path_literal_remains_in_served_code():
+    """Guards the class, not one instance: a relative literal is how the bug returns.
 
-    `resolve()` and `abspath()` call `os.getcwd()`, so a relative resource literal
-    in served code reintroduces the outage. `"logs/{time}.log"` is allowed: it is
-    appended to an absolute directory, so it never reaches `getcwd()`.
+    `resolve()` and `abspath()` call `os.getcwd()`, and a relative `open()`/`glob()`
+    resolves against the working directory too, so any literal relative path in
+    served code reintroduces the 2026-11-17 outage. The names in `common/paths.py`
+    are the only sanctioned roots.
     """
 
-    served = [APP_ROOT / "common", APP_ROOT / "endpoints", APP_ROOT / "backends"]
+    served = [
+        APP_ROOT / "common",
+        APP_ROOT / "endpoints",
+        APP_ROOT / "backends",
+        APP_ROOT / "main.py",
+    ]
     offenders = []
 
     for root in served:
-        for path in sorted(root.rglob("*.py")):
+        paths = [root] if root.is_file() else sorted(root.rglob("*.py"))
+        for path in paths:
             if path == APP_ROOT / "common" / "paths.py":
                 continue
             for lineno, line in enumerate(path.read_text().splitlines(), start=1):
                 stripped = line.strip()
                 if stripped.startswith("#"):
                     continue
-                if 'Path("templates")' in stripped or 'Path("logs")' in stripped:
-                    offenders.append(f"{path.relative_to(APP_ROOT)}:{lineno}: {stripped}")
-                elif 'Path("logs/' in stripped and "LOGS_DIR" not in stripped:
-                    offenders.append(f"{path.relative_to(APP_ROOT)}:{lineno}: {stripped}")
+                for match in re.finditer(r"""Path\(\s*["']([^"']*)["']""", stripped):
+                    if not match.group(1).startswith(("/", "\\")):
+                        offenders.append(
+                            f"{path.relative_to(APP_ROOT)}:{lineno}: {stripped}"
+                        )
 
-    assert not offenders, "relative resource literal(s):\n" + "\n".join(offenders)
+    assert not offenders, "relative path literal(s):\n" + "\n".join(offenders)
