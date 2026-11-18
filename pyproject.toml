@@ -16,7 +16,9 @@ build-backend = "setuptools.build_meta"
 py-modules = ["main", "start"]
 
 [tool.setuptools.packages.find]
-include = ["common*", "backends*", "endpoints*", "templates*", "sampler_overrides*"]
+# `tests` ships on purpose: setup-exl3-flashnext.sh runs its model-free tool-call suites
+# against the INSTALLED artifact, which is the only way to verify what actually boots.
+include = ["common*", "backends*", "endpoints*", "templates*", "sampler_overrides*", "tests*"]
 namespaces = true
 
 [tool.setuptools.package-data]
