@@ -17,6 +17,7 @@ from ruamel.yaml.tokens import CommentToken
 from common import model
 from common.networking import get_generator_error, handle_request_disconnect
 from common.model_meta import is_model_dir, read_model_meta
+from common.paths import runtime_path
 from common.tabby_config import config
 from common.config_models import DraftModelConfig, ModelConfig
 from common.templating import get_all_templates
@@ -70,9 +71,9 @@ def get_model_list(model_path: pathlib.Path, draft_model_path: Optional[str] = N
     # Convert the provided draft model path to a pathlib path for
     # equality comparisons
     if draft_model_path:
-        draft_model_path = pathlib.Path(draft_model_path).resolve()
+        draft_model_path = runtime_path(draft_model_path).resolve()
 
-    root = model_path.resolve()
+    root = runtime_path(model_path).resolve()
     model_card_list = ModelList()
 
     # The loaded model's entry also says how it is loaded, as the current-model

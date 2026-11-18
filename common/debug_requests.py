@@ -10,10 +10,11 @@ from fastapi import Request
 
 from common.logger import xlogger
 from common.networking import request_tag
+from common.paths import LOGS_DIR
 from common.tabby_config import config
 
 
-DEBUG_LOG_DIR = Path("logs/debug")
+DEBUG_LOG_DIR = LOGS_DIR / "debug"
 
 SENSITIVE_HEADERS = {
     "authorization",

@@ -11,6 +11,7 @@ import re
 from collections.abc import Mapping, Sequence, Set
 
 from loguru import logger
+from common.paths import LOGS_DIR
 from rich.console import Console
 from rich.progress import (
     BarColumn,
@@ -155,7 +156,7 @@ def setup_logger():
     )
     # Add file logging
     logger.add(
-        "logs/{time}.log",
+        str(LOGS_DIR / "{time}.log"),
         level=LOG_LEVEL,
         format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {message}",
         rotation="20 MB",  # Rotate file when it reaches 20MB

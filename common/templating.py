@@ -11,6 +11,7 @@ from jinja2 import Template, TemplateError, nodes
 from jinja2.ext import Extension, loopcontrols
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 from common.logger import xlogger
+from common.paths import TEMPLATES_DIR
 from packaging import version
 
 
@@ -199,7 +200,7 @@ class PromptTemplate:
 def get_all_templates():
     """Fetches all templates from the templates directory"""
 
-    template_directory = pathlib.Path("templates")
+    template_directory = TEMPLATES_DIR
     return template_directory.glob("*.jinja")
 
 
@@ -243,7 +244,7 @@ async def find_prompt_template(template_name, model_dir: pathlib.Path):
     # TODO: Possibly link to the TokenizerConfig class
     if template_name:
         find_template_functions[:0] = [
-            lambda: PromptTemplate.from_file(pathlib.Path("templates") / template_name),
+            lambda: PromptTemplate.from_file(TEMPLATES_DIR / template_name),
             lambda: PromptTemplate.from_model_json(
                 model_dir / "tokenizer_config.json",
                 key="chat_template",

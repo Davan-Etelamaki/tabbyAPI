@@ -1,4 +1,3 @@
-import pathlib
 from common import model
 from endpoints.OAI.types.common import (
     CompletionTokensDetails,
@@ -10,6 +9,7 @@ from common.tabby_config import config
 from common.auth import get_key_permission
 from common.logger import xlogger
 from common.networking import handle_request_error
+from common.paths import runtime_path
 from fastapi import HTTPException, Request
 
 
@@ -147,7 +147,7 @@ def _is_loaded_model(model_name: str) -> bool:
     if loaded_model_dir.name == model_name:
         return True
 
-    requested_path = pathlib.Path(config.model.model_dir) / model_name
+    requested_path = runtime_path(config.model.model_dir) / model_name
     try:
         return requested_path.resolve() == loaded_model_dir.resolve()
     except OSError:
@@ -195,7 +195,7 @@ async def load_inline_model(model_name: str, request: Request):
         xlogger.warning(f"Dummy model {str(model_name)} provided. Skipping inline load.")
         return
 
-    model_path = pathlib.Path(config.model.model_dir)
+    model_path = runtime_path(config.model.model_dir)
     model_path = model_path / model_name
 
     # A request that names a model it can't get must fail rather than run on
