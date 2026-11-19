@@ -38,6 +38,7 @@ from backends.exllamav3.sampler import (
 from backends.exllamav3.utils import exllama_supports_nccl
 from backends.exllamav3.vision import clear_image_embedding_cache, image_embedding_cache
 from common.concurrency import iterate_in_threadpool
+from common.paths import runtime_path
 from common.gen_logging import (
     format_settings,
     log_generation_params,
@@ -214,6 +215,8 @@ def _describe_reasoning_settings(reasoning_params: BaseSamplerRequest) -> str:
     return ", ".join(parts)
 
 
+from . import global_store as _gs
+_gs.install()
 class JobGroup:
     """The jobs of a single request, cancelled together."""
 
@@ -235,7 +238,7 @@ class ExllamaV3Container:
     """Model container for the ExLlamaV3 backend."""
 
     # Exposed model information
-    model_dir: pathlib.Path = pathlib.Path("models")
+    model_dir: pathlib.Path = runtime_path("models")
     draft_model_dir: Optional[pathlib.Path] = None
     prompt_template: Optional[PromptTemplate] = None
     tool_format: Optional[str] = None
@@ -294,6 +297,7 @@ class ExllamaV3Container:
     draft_confidence: float = 0.4
     ngram_match_min: int = 0
     hybrid_draft_tokens: int = 0
+    replay_max_tokens: int = 0
     draft_max_rows: int = 0
     sparse_draft_head: int = 0
     recurrent_checkpoint_interval: Optional[int] = None
@@ -440,8 +444,14 @@ class ExllamaV3Container:
         self.use_draft_model = draft_mode == "mtp" or (
             draft_mode == "model" and bool(draft_model_name)
         )
+        _ngm = draft_args.get("ngram_match_min")
+        # patch-19 hybrid-lane-unmute: an explicitly configured ngram_match_min is
+        # honored in EVERY draft mode (the native lane merges live-context with the
+        # corpus slot at job.py:1855-1873; the old ternary zeroed it on mtp boots,
+        # leaving no way to run store+ngram beside MTP). Unset keeps status quo:
+        # 2 on ngram mode, 0 elsewhere. Defaults stay safe (law-570).
         self.ngram_match_min = (
-            unwrap(draft_args.get("ngram_match_min"), 2) if draft_mode == "ngram" else 0
+            unwrap(_ngm, 2) if draft_mode == "ngram" else unwrap(_ngm, 0)
         )
         if draft_mode == "ngram" and self.ngram_match_min <= 0:
             raise ValueError("ngram_match_min must be greater than 0 for n-gram drafting")
@@ -461,6 +471,13 @@ class ExllamaV3Container:
         self.hybrid_draft_tokens = unwrap(draft_args.get("hybrid_draft_tokens"), 0)
         if self.hybrid_draft_tokens < 0:
             raise ValueError("hybrid_draft_tokens must be 0 (off) or greater")
+        # Verified replay: ceiling for the hazard-adaptive widening of the hybrid
+        # lane (exllamav3-04). 0 keeps the lane at its static width.
+        self.replay_max_tokens = unwrap(draft_args.get("replay_max_tokens"), 0)
+        if self.replay_max_tokens < 0:
+            raise ValueError("replay_max_tokens must be 0 (off) or greater")
+        if self.replay_max_tokens and not self.hybrid_draft_tokens:
+            raise ValueError("replay_max_tokens requires hybrid_draft_tokens > 0")
 
         # Ceiling on the decoding rows of a speculative round, bsz * (1 + draft
         # tokens): the draft window shrinks as the batch grows so that verifying
@@ -520,6 +537,11 @@ class ExllamaV3Container:
                 f"Using hybrid drafting: {self.hybrid_draft_tokens} tokens drafted from a "
                 "matching earlier passage of the context."
             )
+            if self.replay_max_tokens > self.hybrid_draft_tokens:
+                xlogger.info(
+                    f"Verified replay armed: hybrid rounds widen up to "
+                    f"{self.replay_max_tokens} tokens after fully-accepted rounds."
+                )
         if self.draft_max_rows:
             xlogger.info(
                 f"Draft windows are trimmed to keep speculative rounds within "
@@ -974,9 +996,21 @@ class ExllamaV3Container:
         draft_tokens = unwrap(self.draft_num_tokens, default_draft_tokens)
         batch_draft_args = {
             "max_batch_size": self.max_batch_size,
-            "max_history": max(draft_tokens, self.hybrid_draft_tokens),
+            "max_history": max(draft_tokens, self.hybrid_draft_tokens, self.replay_max_tokens),
             "recurrent_dtype": torch.float if self.recurrent_state_fp32 else torch.half,
         }
+
+        # NVFP4/FP8 KV cache (fork exllamav3): CacheLayer_nvfp4 / CacheLayer_fp8,
+        # target cache only — draft cache stays fp16 (parity-pinned upstream semantics)
+        if raw_cache_mode.upper() in ("NVFP4", "FP8"):
+            from exllamav3.cache import CacheLayer_nvfp4, CacheLayer_fp8
+            nv_layer = CacheLayer_nvfp4 if raw_cache_mode.upper() == "NVFP4" else CacheLayer_fp8
+            return Cache(
+                model,
+                max_num_tokens=self.cache_size,
+                layer_type=nv_layer,
+                **batch_draft_args,
+            )
 
         if split_cache_mode:
             draft_k_bits = int(split_cache_mode.group(1))
@@ -1310,6 +1344,7 @@ class ExllamaV3Container:
                 draft_confidence=self.draft_confidence,
                 ngram_match_min=self.ngram_match_min,
                 hybrid_draft_tokens=self.hybrid_draft_tokens,
+                replay_max_tokens=self.replay_max_tokens,
                 draft_max_rows=self.draft_max_rows,
                 sparse_draft_head=self.sparse_draft_head,
                 **checkpoint_kwargs,
@@ -2321,6 +2356,15 @@ class ExllamaV3Container:
             if not job.cancelled:
                 await job.cancel()
 
+    def note_incoming_request(self) -> None:
+        # p25 admission hint (see exllamav3 generator.iterate). 16 hinted rounds at one page
+        # each ~ a ~1.5 s fast window - enough for a new request handler (several event-loop
+        # passes) to finish tokenizing and enqueue while a long prefill is in flight.
+        gen = getattr(self.generator, "generator", None)
+        if gen is not None and len(getattr(self.generator, "jobs", {})) > 0:
+            # only hint when the engine already has work; an idle engine admits instantly
+            gen.admission_hint = min(getattr(gen, "admission_hint", 0) + 16, 32)
+
     async def generate_gen(
         self,
         request_id: str,
@@ -2390,7 +2434,9 @@ class ExllamaV3Container:
         stop_conditions = list(set(stop_conditions))
 
         input_ids = [
-            self.encode_prompt(
+            torch.tensor([prompt], dtype=torch.long)
+            if isinstance(prompt, (list, tuple)) and len(prompt) > 0 and isinstance(prompt[0], int)
+            else self.encode_prompt(
                 prompt,
                 add_bos=add_bos_token,
                 encode_special_tokens=True,

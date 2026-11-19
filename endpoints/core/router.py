@@ -18,6 +18,7 @@ from common.networking import (
     handle_request_error,
     run_with_request_disconnect,
 )
+from common.paths import TEMPLATES_DIR, runtime_path
 from common.tabby_config import config
 from common.templating import PromptTemplate, get_all_templates
 from common.utils import unwrap
@@ -149,7 +150,7 @@ async def list_models(request: Request) -> ModelList:
     """
 
     model_dir = config.model.model_dir
-    model_path = pathlib.Path(model_dir)
+    model_path = runtime_path(model_dir)
 
     draft_model_dir = config.draft_model.draft_model_dir
 
@@ -209,7 +210,7 @@ async def list_draft_models(request: Request) -> ModelList:
 
     if get_key_permission(request) == "admin":
         draft_model_dir = config.draft_model.draft_model_dir
-        draft_model_path = pathlib.Path(draft_model_dir)
+        draft_model_path = runtime_path(draft_model_dir)
 
         models = get_model_list(draft_model_path.resolve())
     else:
@@ -232,7 +233,7 @@ async def load_model(data: ModelLoadRequest) -> ModelLoadResponse:
 
         raise HTTPException(400, error_message)
 
-    model_path = pathlib.Path(config.model.model_dir)
+    model_path = runtime_path(config.model.model_dir)
     model_path = model_path / data.model_name
 
     if not model_path.exists():
@@ -254,7 +255,7 @@ async def model_load_config(model_name: str) -> ModelLoadConfigResponse:
     keys. Also given as YAML, ready to edit and send back with a load request.
     """
 
-    model_path = pathlib.Path(config.model.model_dir) / model_name
+    model_path = runtime_path(config.model.model_dir) / model_name
     if not model_path.is_dir():
         error_message = handle_request_error(
             f"Model {model_name} was not found in the model directory.",
@@ -330,7 +331,7 @@ async def save_load_options(data: ModelLoadConfigSaveRequest) -> ModelLoadConfig
 
     # Only model folders under the model directory, by name, not by where a
     # symlinked folder points
-    model_root = pathlib.Path(os.path.normpath(config.model.model_dir))
+    model_root = runtime_path(os.path.normpath(config.model.model_dir))
     model_path = pathlib.Path(os.path.normpath(model_root / data.model_name))
     if (
         model_path == model_root
@@ -470,7 +471,7 @@ async def list_all_loras(request: Request) -> LoraList:
     """
 
     if get_key_permission(request) == "admin":
-        lora_path = pathlib.Path(config.lora.lora_dir)
+        lora_path = runtime_path(config.lora.lora_dir)
         loras = get_lora_list(lora_path.resolve())
     else:
         loras = get_active_loras()
@@ -505,7 +506,7 @@ async def load_lora(data: LoraLoadRequest) -> LoraLoadResponse:
 
         raise HTTPException(400, error_message)
 
-    lora_dir = pathlib.Path(config.lora.lora_dir)
+    lora_dir = runtime_path(config.lora.lora_dir)
     if not lora_dir.exists():
         error_message = handle_request_error(
             "A parent lora directory does not exist for load. Check your config.yml?",
@@ -543,7 +544,7 @@ async def list_embedding_models(request: Request) -> ModelList:
 
     if get_key_permission(request) == "admin":
         embedding_model_dir = config.embeddings.embedding_model_dir
-        embedding_model_path = pathlib.Path(embedding_model_dir)
+        embedding_model_path = runtime_path(embedding_model_dir)
 
         models = get_model_list(embedding_model_path.resolve())
     else:
@@ -576,7 +577,7 @@ async def load_embedding_model(
 
         raise HTTPException(400, error_message)
 
-    embedding_model_dir = pathlib.Path(config.embeddings.embedding_model_dir)
+    embedding_model_dir = runtime_path(config.embeddings.embedding_model_dir)
     embedding_model_path = embedding_model_dir / data.embedding_model_name
 
     if not embedding_model_path.exists():
@@ -745,7 +746,7 @@ async def switch_template(data: TemplateSwitchRequest):
         raise HTTPException(400, error_message)
 
     try:
-        template_path = pathlib.Path("templates") / data.prompt_template_name
+        template_path = TEMPLATES_DIR / data.prompt_template_name
         model.container.prompt_template = await PromptTemplate.from_file(template_path)
     except FileNotFoundError as e:
         error_message = handle_request_error(

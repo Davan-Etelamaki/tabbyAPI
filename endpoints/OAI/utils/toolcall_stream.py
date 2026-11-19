@@ -1,46 +1,34 @@
 """
-Incremental streaming of OpenAI tool_calls deltas while the model is still
-writing the call.
+Incremental streaming of OpenAI tool_calls deltas for the qwen3_coder
+pseudo-XML tool call format.
 
-The end-of-stream parsers (toolcall_formats/) collect the full tool text and
-parse it in one pass, so streaming clients would otherwise receive the complete
-tool call as a single delta after generation finishes, and a harness cannot
-show a long call being written or start executing a finished call while the
-next one is still being generated.
+The end-of-stream parser (toolcall_formats/qwen3_coder.py) collects the full
+tool text and parses it in one pass, so streaming clients receive the
+complete tool call as a single delta after generation finishes and live UIs
+cannot show tool generation as it happens.
 
-Two parts, so that a format only has to supply a tokenizer:
+QwenToolCallDeltaStreamer consumes TOOL-channel text as it arrives (from
+TagStreamParser, which keeps the format's own wrapper tags, TOOLCALL_START
+and TOOLCALL_END, in the tool channel) and emits OpenAI-style tool_calls
+delta fragments:
 
-  ToolCallDeltaEmitter turns format-independent events (a call opens, a
-  parameter opens, value text arrives, the parameter closes, the call closes)
-  into OpenAI-style tool_calls deltas:
+  - when a function opens: {index, id, type, function: {name, arguments: "{"}}
+  - when a parameter closes: {index, function: {arguments: <json fragment>}}
+  - when the function closes: {index, function: {arguments: "}"}}
 
-    - when a call opens: {index, id, type, function: {name, arguments: "{"}}
-    - as a parameter's value is streamed or closes: {index, function: {arguments: <fragment>}}
-    - when the call closes: {index, function: {arguments: "}"}}
-
-  Whether a value can be streamed as it arrives depends on its type, because
-  "123" and 123 are different JSON. The request's tool schema decides: a
-  parameter declared `string` streams from its first character; a parameter
-  with another declared type is emitted whole when it closes, as the value
-  coerce_param_value() parses; a parameter the schema doesn't type falls back
-  to type guessing and is held until the accumulated text provably cannot be a
-  JSON literal (see _is_streamable). Values are stripped of surrounding
-  whitespace exactly as the end-of-stream parsers do, so trailing whitespace is
-  held back until later text makes it interior.
-
-  QwenToolCallDeltaStreamer is the tokenizer for the qwen3_coder pseudo-XML
-  (<function=NAME> ... <parameter=KEY>VALUE</parameter> ... </function>),
-  consuming TOOL-channel text as TagStreamParser produces it (the format's own
-  wrapper tags included) and driving the emitter. Other formats register their
-  tokenizer in DELTA_STREAMERS.
+String parameter values are additionally streamed while they are generated
+(as a JSON string), as soon as it is provable that the value cannot parse as
+a JSON literal (see _is_streamable). Values that coerce_param_value() may
+convert (objects, arrays, numbers, booleans, null, quoted strings) are
+emitted whole when their parameter closes.
 
 Guarantee: for well-formed calls, the concatenation of all "arguments"
-fragments per index is byte-identical to the arguments string produced by the
-end-of-stream parser given the same tool schema, so the assembled tool call is
-unchanged. Malformed model output is handled the way the end-of-stream regexes
-read it (stray close tags and parameters outside a function block are dropped,
-a nested function open belongs to the outer call). Fragments cannot be
-retracted, so three inputs diverge on purpose and are reported by verify():
+fragments per index is byte-identical to the arguments string produced by
+the end-of-stream parser, so the assembled tool call is unchanged. Malformed
+model output is handled the way the end-of-stream regexes read it (stray
+close tags and parameters outside a function block are dropped, a nested
+function open belongs to the outer call). Fragments cannot be retracted, so
+three inputs diverge on purpose and are reported by verify():
 
   - a call that generation never closes (cut off by max_tokens): the regex
     drops the whole call, the client already has the partial arguments
@@ -57,7 +45,12 @@ from uuid import uuid4
 from common.logger import xlogger
 from endpoints.OAI.utils.toolcall_formats import qwen3_coder
 from endpoints.OAI.utils.toolcall_formats.common import coerce_param_value
-from endpoints.OAI.utils.tools import canonical_format_name
+
+_FUNC_OPEN = re.compile(r"<function=([^>\s]+)[^>]*>")
+_PARAM_OPEN = re.compile(r"<parameter=([^>\s]+)[^>]*>")
+
+_FUNC_CLOSE = "</function>"
+_PARAM_CLOSE = "</parameter>"
 
 # First characters whose stripped value may still json.loads() to something
 # other than the exact input string, per coerce_param_value(). Such values
@@ -92,45 +85,71 @@ def _esc(text: str) -> str:
     return json.dumps(text, ensure_ascii=False)[1:-1]
 
 
-class ToolCallDeltaEmitter:
+class QwenToolCallDeltaStreamer:
     """
-    Assembles OpenAI tool_calls deltas from format-independent events. A format
-    tokenizer calls open_call / open_param / value_text / close_param /
-    close_call with the frame's delta list; each call appends the deltas that
-    are ready. emitted is True once any fragment was produced.
+    Emits OAI tool_calls deltas incrementally for qwen3_coder pseudo-XML.
+
+    feed() accepts TOOL-channel text and returns a list of delta dicts to be
+    sent as one streaming frame (empty list when nothing is ready). emitted
+    is True once any fragment was produced; verify() should be called at the
+    end of the stream with the full tool text to cross-check the assembled
+    calls against the authoritative end-of-stream parser.
     """
 
-    def __init__(self, param_types: Optional[dict] = None):
-        self.param_types = param_types or {}
+    _OUT = 0
+    _VALUE = 1
+
+    def __init__(self, valid_names=None):
+        self._valid = set(valid_names) if valid_names is not None else None
         self.emitted = False
+        self._unsafe = False
+        self._released = False
+        self._cur: list = []
+        self._block_raw = ""
+
+        self._state = self._OUT
+        self._buf = ""
 
         self._index = -1
-        self._in_call = False
+        self._in_func = False
         self._first_param = True
         self._keys: set[str] = set()
 
         self._param_key: Optional[str] = None
-        self._declared: Optional[str] = None
         self._raw = ""
         self._streaming = False
         self._sent = ""
 
-        # One name and assembled arguments string per call, for verify()
         self._names: list[str] = []
         self._assembled: list[str] = []
 
-    @property
-    def in_call(self) -> bool:
-        return self._in_call
-
     # -- emission helpers
+
+    def _open_function(self, name: str) -> dict:
+        self._index += 1
+        self._first_param = True
+        self._keys = set()
+        self._assembled.append("{")
+        self._names.append(name)
+        return {
+            "index": self._index,
+            "id": f"call_{uuid4().hex[:24]}",
+            "type": "function",
+            "function": {"name": name, "arguments": "{"},
+        }
+
+    def _param_prefix(self) -> str:
+        key = json.dumps(self._param_key, ensure_ascii=False)
+        if self._first_param:
+            self._first_param = False
+            return key + ": "
+        return ", " + key + ": "
 
     def _arg_fragment(self, fragment: str) -> dict:
         self._assembled[self._index] += fragment
         return {"index": self._index, "function": {"arguments": fragment}}
 
     def _emit(self, deltas: list, delta: dict):
-        self.emitted = True
 
         # Merge consecutive fragments for the same index into one entry so a
         # frame never carries two deltas for the same tool call.
@@ -149,218 +168,6 @@ class ToolCallDeltaEmitter:
             deltas[-1] = merged
         else:
             deltas.append(delta)
-
-    def _param_prefix(self) -> str:
-        key = json.dumps(self._param_key, ensure_ascii=False)
-        if self._first_param:
-            self._first_param = False
-            return key + ": "
-        return ", " + key + ": "
-
-    # -- events
-
-    def open_call(self, name: str, deltas: list):
-        self._index += 1
-        self._in_call = True
-        self._first_param = True
-        self._keys = set()
-        self._assembled.append("{")
-        self._names.append(name)
-        self._emit(
-            deltas,
-            {
-                "index": self._index,
-                "id": f"call_{uuid4().hex[:24]}",
-                "type": "function",
-                "function": {"name": name, "arguments": "{"},
-            },
-        )
-
-    def close_call(self, deltas: list):
-        self._emit(deltas, self._arg_fragment("}"))
-        self._in_call = False
-
-    def open_param(self, key: str, deltas: list):
-        self._param_key = key
-        if key in self._keys:
-            # The end-of-stream parser keeps the last occurrence; the
-            # duplicate key we stream still parses to the same dict.
-            xlogger.debug(
-                "Duplicate parameter in tool call stream",
-                {"function": self._names[self._index], "key": key},
-            )
-        self._keys.add(key)
-        self._declared = self.param_types.get(self._names[self._index], {}).get(key)
-        self._raw = ""
-        self._streaming = False
-        self._sent = ""
-
-    def value_text(self, text: str, deltas: list):
-        if not text:
-            return
-
-        self._raw += text
-
-        if not self._streaming:
-            stripped = self._raw.strip()
-            if not stripped:
-                return
-            if self._declared == "string":
-                streamable = True
-            elif self._declared is not None:
-                # A typed non-string value is parsed when it closes
-                streamable = False
-            else:
-                streamable = _is_streamable(stripped)
-            if streamable:
-                self._streaming = True
-                self._sent = stripped
-                self._emit(deltas, self._arg_fragment(self._param_prefix() + '"' + _esc(stripped)))
-            return
-
-        # Streaming: the stripped prefix of the raw value grows monotonically;
-        # trailing whitespace stays unemitted until later text makes it
-        # interior, matching the strip() applied by the end-of-stream parser.
-        candidate = self._raw.strip()
-        new = candidate[len(self._sent) :]
-        if new:
-            self._sent = candidate
-            self._emit(deltas, self._arg_fragment(_esc(new)))
-
-    def close_param(self, deltas: list):
-        if self._streaming:
-            # Close the JSON string. The streamed content must equal the
-            # stripped raw value; guard against any drift.
-            final = json.dumps(self._raw.strip(), ensure_ascii=False)
-            streamed = '"' + _esc(self._sent) + '"'
-            if final != streamed:
-                xlogger.error(
-                    "Tool-call delta stream diverged from value at parameter close",
-                    {"function": self._names[self._index], "key": self._param_key},
-                )
-            self._emit(deltas, self._arg_fragment('"'))
-        else:
-            value = coerce_param_value(self._raw, self._declared)
-            self._emit(
-                deltas,
-                self._arg_fragment(self._param_prefix() + json.dumps(value, ensure_ascii=False)),
-            )
-
-        self._param_key = None
-        self._declared = None
-        self._raw = ""
-        self._streaming = False
-        self._sent = ""
-
-    # -- end-of-stream cross-check
-
-    def verify(self, authoritative: list, label: str):
-        """
-        Compare the streamed assembly against the authoritative end-of-stream
-        parse (ToolCall objects). Log-only: streamed fragments cannot be
-        retracted.
-
-        Byte-identical for well-formed calls. Degenerate inputs (duplicate
-        parameter keys) may differ in bytes but must parse to the same calls,
-        and a call that generation was cut off inside is reported as an error,
-        because the parser drops a call that never closes.
-        """
-
-        try:
-            # strict=False: a length mismatch here is itself a divergence,
-            # and is reported by the comparison below rather than raised here
-            mine = list(zip(self._names, self._assembled, strict=False))
-            theirs = [(c.function.name, c.function.arguments) for c in authoritative]
-            if mine == theirs:
-                return
-
-            parsed_equal = len(mine) == len(theirs) and all(
-                n1 == n2 and json.loads(a1) == json.loads(a2)
-                for (n1, a1), (n2, a2) in zip(mine, theirs, strict=False)
-            )
-            if parsed_equal:
-                xlogger.debug(
-                    f"Tool-call delta stream differs byte-wise but parses equal "
-                    f"for {label} (duplicate parameter keys?)",
-                    {"streamed": mine, "authoritative": theirs},
-                )
-            else:
-                # The common cause in practice: generation was cut off inside a
-                # call, and the end-of-stream regex drops a function block that
-                # never closes. Say so, because the fragments were already sent.
-                hint = ""
-                if len(mine) > len(theirs):
-                    hint = (
-                        " (more calls streamed than parsed: the last call was "
-                        "probably truncated, and the end-of-stream parser drops "
-                        "a function block without a closing tag)"
-                    )
-                xlogger.error(
-                    f"Tool-call delta stream differs from end-of-stream parse for {label}{hint}",
-                    {"streamed": mine, "authoritative": theirs},
-                )
-        except Exception as exc:  # never fail the stream on verification
-            xlogger.debug(f"Tool-call delta verification skipped: {exc}")
-
-
-_FUNC_OPEN = re.compile(r"<function=([^>\s]+)[^>]*>")
-_PARAM_OPEN = re.compile(r"<parameter=([^>\s]+)[^>]*>")
-
-_FUNC_CLOSE = "</function>"
-_PARAM_CLOSE = "</parameter>"
-
-
-class QwenToolCallDeltaStreamer:
-    """
-    Tokenizer for qwen3_coder pseudo-XML, driving a ToolCallDeltaEmitter.
-
-    feed() accepts TOOL-channel text and returns a list of delta dicts to be
-    sent as one streaming frame (empty list when nothing is ready). emitted
-    is True once any fragment was produced; verify() should be called at the
-    end of the stream with the full tool text to cross-check the assembled
-    calls against the authoritative end-of-stream parser.
-    """
-
-    _OUT = 0
-    _VALUE = 1
-
-    def __init__(self, param_types: Optional[dict] = None):
-        self.param_types = param_types
-        self.emitter = ToolCallDeltaEmitter(param_types)
-
-        self._state = self._OUT
-        self._buf = ""
-
-    # The emitter's bookkeeping, as the cross-check and tests read it
-    @property
-    def emitted(self) -> bool:
-        return self.emitter.emitted
-
-    @emitted.setter
-    def emitted(self, value: bool):
-        self.emitter.emitted = value
-
-    @property
-    def names(self) -> list:
-        """Function names of the calls streamed so far, in index order."""
-
-        return list(self.emitter._names)
-
-    @property
-    def _names(self) -> list:
-        return self.emitter._names
-
-    @_names.setter
-    def _names(self, value: list):
-        self.emitter._names = value
-
-    @property
-    def _assembled(self) -> list:
-        return self.emitter._assembled
-
-    @_assembled.setter
-    def _assembled(self, value: list):
-        self.emitter._assembled = value
 
     # -- buffer management
 
@@ -390,8 +197,9 @@ class QwenToolCallDeltaStreamer:
     # -- main entry point
 
     def feed(self, text: str) -> list:
-        deltas: list = []
-        emitter = self.emitter
+        flushed: list = []
+        if self._unsafe:
+            return flushed
         self._buf += text
 
         while True:
@@ -401,12 +209,41 @@ class QwenToolCallDeltaStreamer:
                     hold = self._partial_close_hold(self._buf)
                     consume = self._buf[: len(self._buf) - hold] if hold else self._buf
                     self._buf = self._buf[len(self._buf) - hold :] if hold else ""
-                    emitter.value_text(consume, deltas)
+                    self._block_raw += consume
+                    self._consume_value(consume, self._cur)
                     break
 
-                emitter.value_text(self._buf[:close], deltas)
+                state = qwen3_coder.boundary_state(
+                    self._buf[close + len(_PARAM_CLOSE) :],
+                    qwen3_coder._AFTER_PARAM_CLOSE,
+                    at_end=False,
+                )
+                if state == "unknown":
+                    # Only whitespace has arrived after the close tag, so whether
+                    # it ends this value is not decidable yet. Hold the tag and
+                    # let the next chunk decide; if the stream ends here the block
+                    # never releases and the release guard falls back to the
+                    # end-of-stream parse, so nothing partial reaches the client.
+                    consume = self._buf[:close]
+                    self._block_raw += consume
+                    self._consume_value(consume, self._cur)
+                    self._buf = self._buf[close:]
+                    break
+                if state == "literal":
+                    # Markup inside a value: this close tag is value content, not
+                    # a boundary. Streaming it is what keeps the fragments equal
+                    # to the end-of-stream parse for the shape that used to
+                    # truncate the argument.
+                    consume = self._buf[: close + len(_PARAM_CLOSE)]
+                    self._block_raw += consume
+                    self._consume_value(consume, self._cur)
+                    self._buf = self._buf[close + len(_PARAM_CLOSE) :]
+                    continue
+
+                self._block_raw += self._buf[:close] + _PARAM_CLOSE
+                self._consume_value(self._buf[:close], self._cur)
                 self._buf = self._buf[close + len(_PARAM_CLOSE) :]
-                emitter.close_param(deltas)
+                self._close_param(self._cur)
                 self._state = self._OUT
                 continue
 
@@ -429,51 +266,202 @@ class QwenToolCallDeltaStreamer:
                 break
 
             kind, _start, end, name = min(candidates, key=lambda c: c[1])
+            raw = self._buf[:end]
             self._buf = self._buf[end:]
 
             if kind == "func":
-                if emitter.in_call:
+                if self._in_func:
                     # A nested open is body text of the outer call for the
                     # end-of-stream regex, whose name is the outer one. Keep
                     # the outer call and drop this tag.
+                    self._block_raw += raw
                     continue
-                emitter.open_call(name, deltas)
+                if self._valid is not None and name not in self._valid:
+                    xlogger.error(
+                        "Tool-call delta stream: dropping call with unknown name",
+                        {"name": name},
+                    )
+                    continue
+                self._in_func = True
+                self._block_raw = raw
+                self._cur = []
+                self._emit(self._cur, self._open_function(name))
             elif kind == "fclose":
-                if not emitter.in_call:
+                if not self._in_func:
                     # Stray close: outside a function block the end-of-stream
                     # regex drops it, so consume it silently here too.
                     continue
-                emitter.close_call(deltas)
+                self._block_raw += raw
+                self._emit(self._cur, self._arg_fragment("}"))
+                self._in_func = False
                 self._state = self._OUT
-            elif not emitter.in_call:
+                if self._verify_block(self._index):
+                    flushed.extend(self._cur)
+                    self._released = True
+                    self.emitted = True
+                self._cur = []
+            elif not self._in_func:
                 # A parameter outside a function block is dropped by the
                 # end-of-stream regex; consume it silently.
                 continue
             else:
-                emitter.open_param(name.strip(), deltas)
+                self._param_key = name.strip()
+                if self._param_key in self._keys:
+                    # The end-of-stream parser keeps the last occurrence; the
+                    # duplicate key we stream still parses to the same dict.
+                    xlogger.debug(
+                        "Duplicate parameter in tool call stream",
+                        {"function": self._names[self._index], "key": self._param_key},
+                    )
+                self._block_raw += raw
+                self._keys.add(self._param_key)
+                self._raw = ""
+                self._streaming = False
+                self._sent = ""
                 self._state = self._VALUE
 
-        return deltas
+        return flushed
 
-    def verify(self, full_tool: str, label: str):
-        """Cross-check against the end-of-stream parse of the same text and schema."""
+    # -- value handling
+
+    def _consume_value(self, text: str, deltas: list):
+        if not text:
+            return
+
+        self._raw += text
+
+        if not self._streaming:
+            stripped = self._raw.strip()
+            if stripped and _is_streamable(stripped):
+                self._streaming = True
+                self._sent = stripped
+                self._emit(deltas, self._arg_fragment(self._param_prefix() + '"' + _esc(stripped)))
+            return
+
+        # Streaming: the stripped prefix of the raw value grows monotonically;
+        # trailing whitespace stays unemitted until later text makes it
+        # interior, matching the strip() applied by the end-of-stream parser.
+        candidate = self._raw.strip()
+        new = candidate[len(self._sent) :]
+        if new:
+            self._sent = candidate
+            self._emit(deltas, self._arg_fragment(_esc(new)))
+
+    def _close_param(self, deltas: list):
+        if self._streaming:
+            # Close the JSON string. The streamed content must equal the
+            # stripped raw value; guard against any drift.
+            final = json.dumps(self._raw.strip(), ensure_ascii=False)
+            streamed = '"' + _esc(self._sent) + '"'
+            if final != streamed:
+                xlogger.error(
+                    "Tool-call delta stream diverged from value at parameter close",
+                    {"function": self._names[self._index], "key": self._param_key},
+                )
+            self._emit(deltas, self._arg_fragment('"'))
+        else:
+            value = coerce_param_value(self._raw)
+            self._emit(
+                deltas,
+                self._arg_fragment(self._param_prefix() + json.dumps(value, ensure_ascii=False)),
+            )
+
+        self._param_key = None
+        self._raw = ""
+        self._streaming = False
+        self._sent = ""
+
+    def _verify_block(self, idx: int) -> bool:
+        """
+        Release-on-close guard: a block's fragments are flushed only when its
+        raw text re-parses byte-identically through the authoritative
+        end-of-stream parser. A mismatch before any release suppresses the
+        whole stream (the collector falls back to the final parse); a
+        mismatch after a release cannot be retracted, so only that block is
+        dropped. The documented divergence classes - markup inside a value,
+        a call truncated at max_tokens - are caught here before the client
+        can dispatch a phantom name or a partial call.
+        """
 
         try:
-            authoritative = qwen3_coder.parse_toolcalls(full_tool, param_types=self.param_types)
+            theirs = qwen3_coder.parse_toolcalls(self._block_raw)
+            ok = (
+                len(theirs) == 1
+                and theirs[0].function.name == self._names[idx]
+                and theirs[0].function.arguments == self._assembled[idx]
+            )
+            if not ok and len(theirs) == 1:
+                # byte-wise divergence that still parses to the same call is
+                # the documented duplicate-parameter-key case: flush it.
+                ok = json.loads(theirs[0].function.arguments) == json.loads(
+                    self._assembled[idx]
+                )
+        except Exception:
+            ok = False
+        if ok:
+            return True
+        if not self._released:
+            self._unsafe = True
+            xlogger.error(
+                "Tool-call delta stream: block failed release guard, falling "
+                "back to end-of-stream parse for the rest of the stream",
+                {"function": self._names[idx]},
+            )
+        else:
+            xlogger.error(
+                "Tool-call delta stream: block failed release guard after "
+                "earlier releases; dropping this block",
+                {"function": self._names[idx]},
+            )
+        return False
+
+    # -- end-of-stream cross-check
+
+    def verify(self, full_tool: str, request_id: str):
+        """
+        Compare the streamed assembly against the authoritative end-of-stream
+        parse. Log-only: streamed fragments cannot be retracted.
+
+        Byte-identical for well-formed calls. Degenerate inputs (duplicate
+        parameter keys) may differ in bytes but must parse to the same calls,
+        and a call that generation was cut off inside is reported as an error,
+        because the parser drops a call that never closes.
+        """
+
+        try:
+            authoritative = qwen3_coder.parse_toolcalls(full_tool)
+            # strict=False: a length mismatch here is itself a divergence,
+            # and is reported by the comparison below rather than raised here
+            mine = list(zip(self._names, self._assembled, strict=False))
+            theirs = [(c.function.name, c.function.arguments) for c in authoritative]
+            if mine == theirs:
+                return
+
+            parsed_equal = len(mine) == len(theirs) and all(
+                n1 == n2 and json.loads(a1) == json.loads(a2)
+                for (n1, a1), (n2, a2) in zip(mine, theirs, strict=False)
+            )
+            if parsed_equal:
+                xlogger.debug(
+                    f"Tool-call delta stream differs byte-wise but parses equal "
+                    f"for request {request_id} (duplicate parameter keys?)",
+                    {"streamed": mine, "authoritative": theirs},
+                )
+            else:
+                # The common cause in practice: generation was cut off inside a
+                # call, and the end-of-stream regex drops a function block that
+                # never closes. Say so, because the fragments were already sent.
+                hint = ""
+                if len(mine) > len(theirs):
+                    hint = (
+                        " (more calls streamed than parsed: the last call was "
+                        "probably truncated, and the end-of-stream parser drops "
+                        "a function block without a closing tag)"
+                    )
+                xlogger.error(
+                    f"Tool-call delta stream differs from end-of-stream parse "
+                    f"for request {request_id}{hint}",
+                    {"streamed": mine, "authoritative": theirs},
+                )
         except Exception as exc:  # never fail the stream on verification
             xlogger.debug(f"Tool-call delta verification skipped: {exc}")
-            return
-        self.emitter.verify(authoritative, label)
-
-
-# Formats with an incremental streamer, by canonical format name
-DELTA_STREAMERS = {
-    "qwen3_coder": QwenToolCallDeltaStreamer,
-}
-
-
-def make_delta_streamer(tool_format: Optional[str], param_types: Optional[dict] = None):
-    """The delta streamer for a format, or None when the format has none."""
-
-    cls = DELTA_STREAMERS.get(canonical_format_name(tool_format)) if tool_format else None
-    return cls(param_types) if cls else None

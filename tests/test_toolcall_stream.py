@@ -452,10 +452,10 @@ class MalformedSequenceTests(ToolCallContractMixin, unittest.TestCase):
         self.assert_matches(self.wrap(inner), expect_calls=1)
 
     def test_unclosed_function_at_end_of_stream(self):
-        # DOCUMENTED DIVERGENCE: the EOS regex needs a closing tag and drops
-        # the call entirely, while the streamer already sent partial
-        # arguments that cannot be retracted. verify() must log the
-        # difference and never raise.
+        # Release-on-close guard: the EOS regex needs a closing tag and drops
+        # the call; the streamer now withholds the fragments too (never
+        # released), so the client and parser agree on zero calls. verify()
+        # still reports the internal difference and never raises.
         inner = func("a", [("x", "\n1\n")], wrapped=False)
         text = self.wrap(inner[: -len(self.FC)])
         for chunker in ("random", "tiny", "whole"):
@@ -464,7 +464,7 @@ class MalformedSequenceTests(ToolCallContractMixin, unittest.TestCase):
                 self.assertEqual(qwen3_coder.parse_toolcalls(tool_text), [])
                 self.assertEqual(streamer._names, ["a"])
                 self.assertEqual(streamer._assembled, ['{"x": 1'])
-                self.assertTrue(streamer.emitted)
+                self.assertFalse(streamer.emitted, "unclosed block must never release")
                 with (
                     patch.object(tcs.xlogger, "error") as error,
                     patch.object(tcs.xlogger, "debug"),
@@ -799,9 +799,56 @@ class FuzzHardeningTests(ToolCallContractMixin, unittest.TestCase):
             (c.function.name, c.function.arguments) for c in qwen3_coder.parse_toolcalls(tool_text)
         ]
         self.assertEqual(list(zip(streamer._names, streamer._assembled)), expected)
-        self.assertGreater(len(frames), 100, "value should have streamed live")
+        self.assertEqual(len(frames), 1, "block releases as one frame at close (release-on-close guard)")
         self.assertTrue(streamer._assembled[0].startswith('{"content": "'))
         self.assertGreater(len(streamer._assembled[0]), len(big))
+
+
+
+class ReleaseGuardRegressionTests(unittest.TestCase):
+    """Regression for the two production divergence classes (SECON-458):
+    markup quoted inside a parameter value, and a call truncated at
+    max_tokens. Both must suppress fragments before release so the client
+    never dispatches a phantom name or a partial call."""
+
+    def test_unknown_name_filtered(self):
+        # The production signature (SECON-458): quoted wire markup that the
+        # channel parser routes into the TOOL channel becomes a structurally
+        # valid call with a name lifted from the quote. Both emission paths
+        # would emit it; the name guard drops it against the request's tool
+        # list before the client can dispatch unknown tool "NAME".
+        quoted = func("example_function_name", [("example_parameter_1", "v")],
+                      wrapped=False)
+        real = func("read_file", [("file_path", "/tmp/a.txt")], wrapped=False)
+        case = quoted + real
+        streamer = QwenToolCallDeltaStreamer(valid_names={"read_file"})
+        frames = streamer.feed(case)
+        names = [d["function"].get("name") for d in frames if "name" in d["function"]]
+        self.assertEqual(names, ["read_file"])
+        self.assertEqual(streamer._names, ["read_file"])
+
+    def test_truncated_call_never_releases(self):
+        case = func("read_file", [("file_path", "/tmp/a.txt")], wrapped=False)
+        cut = case[: case.rfind(LT)]  # drop the closing function tag
+        streamer = QwenToolCallDeltaStreamer()
+        frames = streamer.feed(cut)
+        self.assertEqual(frames, [])
+        self.assertFalse(streamer.emitted)
+
+    def test_clean_blocks_release_on_close(self):
+        case = func("read_file", [("file_path", "/tmp/a.txt")]) + func(
+            "write_note", [("note", "hello world")]
+        )
+        streamer = QwenToolCallDeltaStreamer()
+        frames = streamer.feed(case)
+        self.assertTrue(streamer.emitted)
+        expected = [
+            (c.function.name, c.function.arguments)
+            for c in qwen3_coder.parse_toolcalls(case)
+        ]
+        self.assertEqual(list(zip(streamer._names, streamer._assembled)), expected)
+        names = [d["function"].get("name") for d in frames if "name" in d["function"]]
+        self.assertEqual(names, ["read_file", "write_note"])
 
 
 if __name__ == "__main__":

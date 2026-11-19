@@ -117,6 +117,7 @@ class DraftModelLoadRequest(_WarnOnUnknownFields):
     )
     ngram_match_min: Optional[int] = None
     hybrid_draft_tokens: Optional[int] = None
+    replay_max_tokens: Optional[int] = None
     draft_max_rows: Optional[int] = None
     sparse_draft_head: Optional[int] = None
     draft_rope_scale: Optional[float] = None

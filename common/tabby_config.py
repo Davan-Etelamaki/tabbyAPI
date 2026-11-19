@@ -17,6 +17,7 @@ from common.config_models import (
     TabbyConfigModel,
 )
 from common.logger import set_console_timestamps
+from common.paths import runtime_path
 from common.utils import deep_merge_dicts, filter_none_values, unwrap
 
 yaml = YAML(typ=["rt", "safe"])
@@ -104,7 +105,7 @@ class TabbyConfig(TabbyConfigModel):
         # If actions aren't present, also look from the file
         # TODO: Change logic if file loading requires actions in the future
         if not arguments_dict.get("actions"):
-            configs.insert(0, self._from_file(pathlib.Path("config.yml")))
+            configs.insert(0, self._from_file(runtime_path("config.yml")))
 
         # Remove None (aka unset) values from the configs and merge them together
         # This should be less expensive than pruning the entire merged dictionary

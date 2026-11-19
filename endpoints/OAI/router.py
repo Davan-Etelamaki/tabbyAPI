@@ -2,6 +2,7 @@ import asyncio
 from asyncio import CancelledError, InvalidStateError
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import BaseModel
 from sse_starlette import EventSourceResponse
 
 from common import model
@@ -165,6 +166,12 @@ async def chat_completion_request(
     If stream = true, this returns an SSE stream.
     """
 
+    # p25: hint the engine a request is arriving so in-flight prefill rounds shrink briefly
+    # and this handler can reach enqueue between chunks instead of after the whole prefill.
+    note = getattr(model.container, "note_incoming_request", None)
+    if note is not None:
+        note()
+
     raw_json = await request.json()
     xlogger.debug("[ENDPOINT] /v1/chat/completions", {"raw": raw_json})
 
@@ -280,6 +287,40 @@ async def systemone_request(request: Request, data: SystemOneRequest) -> SystemO
     )
 
 
+# Tokenize / detokenize endpoints (llama.cpp-compatible shapes, also under /v1).
+# The jev toolchain calls /tokenize at the ROOT and reads tokens + count;
+# /detokenize callers read prompt. Measured 2026-10-04: absent (404) on the
+# running build, which fails the jev-medium repoint gate (BACKLOG item 29).
+
+class TokenizeRequest(BaseModel):
+    prompt: str
+    add_special: bool = False
+
+class TokenizeResponse(BaseModel):
+    tokens: list[int]
+    count: int
+
+class DetokenizeRequest(BaseModel):
+    tokens: list[int]
+
+class DetokenizeResponse(BaseModel):
+    prompt: str
+
+@router.post("/tokenize", dependencies=[Depends(check_api_key), Depends(check_model_container)])
+@router.post("/v1/tokenize", dependencies=[Depends(check_api_key), Depends(check_model_container)])
+async def tokenize_endpoint(data: TokenizeRequest) -> TokenizeResponse:
+    tokens = model.container.encode_tokens(
+        data.prompt, add_bos_token=data.add_special
+    ) or []
+    return TokenizeResponse(tokens=list(tokens), count=len(tokens))
+
+@router.post("/detokenize", dependencies=[Depends(check_api_key), Depends(check_model_container)])
+@router.post("/v1/detokenize", dependencies=[Depends(check_api_key), Depends(check_model_container)])
+async def detokenize_endpoint(data: DetokenizeRequest) -> DetokenizeResponse:
+    text = model.container.decode_tokens(list(data.tokens)) or ""
+    return DetokenizeResponse(prompt=text)
+
+
 # Apply template endpoint (llama-server compatible)
 @router.post("/apply-template", dependencies=[Depends(check_api_key)])
 @router.post("/v1/apply-template", dependencies=[Depends(check_api_key)])
@@ -317,3 +358,11 @@ async def embeddings(request: Request, data: EmbeddingsRequest) -> EmbeddingsRes
     )
 
     return response
+
+# p47: Anthropic Messages + OpenAI Responses dialects (text-only v1)
+from endpoints.OAI import compat  # noqa: E402
+router.include_router(compat.router)
+
+# p48: server-side conversation parking (v1)
+from endpoints.OAI import parking  # noqa: E402
+router.include_router(parking.router)

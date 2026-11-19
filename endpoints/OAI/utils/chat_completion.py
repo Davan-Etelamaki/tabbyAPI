@@ -51,9 +51,9 @@ from endpoints.OAI.utils.stream_parser import (
 from endpoints.OAI.utils.tools import (
     get_toolcall_tags,
     parse_toolcalls,
+    supports_delta_streaming,
 )
-from endpoints.OAI.utils.toolcall_formats.common import param_types_from_tools
-from endpoints.OAI.utils.toolcall_stream import make_delta_streamer
+from endpoints.OAI.utils.toolcall_stream import QwenToolCallDeltaStreamer
 from endpoints.OAI.utils.common_ import aggregate_usage_stats, get_timings, get_usage_stats
 
 
@@ -177,11 +177,18 @@ def _compose_response(
 
     choices = []
     for generation in generations:
+        tool_calls = generation.get("tool_calls") or None
+        content = generation.get("content")
+        # tabbyAPI-02: `or None` re-collapsed the empty string the collector
+        # returns back into null; both sites must agree (content stays "").
+        if content is None and tool_calls is None:
+            content = ""
+
         message = ChatCompletionMessage(
             role="assistant",
-            content=generation.get("content") or None,
+            content=content,
             reasoning_content=generation.get("reasoning_content") or None,
-            tool_calls=generation.get("tool_calls") or None,
+            tool_calls=tool_calls,
         )
 
         choices.append(
@@ -698,17 +705,16 @@ def _parse_tool_calls(
     text: str,
     tool_format: str,
     label: str,
-    param_types: Optional[dict] = None,
 ) -> list:
     """
     Parse collected tool calls and convert to OAI format.
 
     Insert tool indices as well. (These are not choice indices; OAI enumerates the tool
-    calls within each individual choice, and the delta streamer numbers them the same way.)
-    param_types carries the parameter types declared by the request's tools.
+    calls within each individual choice for the sake of streaming incomplete tool arg
+    deltas, which we don't do here.)
     """
 
-    parsed = parse_toolcalls(text, tool_format, param_types)
+    parsed = parse_toolcalls(text, tool_format)
     for tc_idx, p in enumerate(parsed):
         p.index = tc_idx
     dumped = [p.model_dump(mode="json") for p in parsed]
@@ -808,11 +814,13 @@ async def _chat_stream_collector(
         use_think = False
         use_tool = False
         parser = HarmonyStreamParser(initial_channel)
+        parser = HarmonyStreamParser(initial_channel)
     elif mc.muse_glimmer:
         # Same for Muse Glimmer, with recipients in place of channels
         tool_format = "muse_glimmer"
         use_think = False
         use_tool = False
+        parser = GlimmerStreamParser(initial_channel)
         parser = GlimmerStreamParser(initial_channel)
     else:
         tool_format = mc.tool_format
@@ -834,13 +842,9 @@ async def _chat_stream_collector(
     # OpenAI-style tool call fragments as they are generated instead of one
     # complete delta at end of stream. The end-of-stream parse stays as the
     # fallback whenever the streamer produced nothing.
-    # Parameter types declared by the request's tools: a string parameter is
-    # never reinterpreted as a JSON literal, and the delta streamer can emit it
-    # as it is generated
-    param_types = param_types_from_tools(params.tools)
     tool_streamer = None
-    if streaming_mode and use_tool:
-        tool_streamer = make_delta_streamer(tool_format, param_types)
+    if streaming_mode and use_tool and supports_delta_streaming(tool_format):
+        tool_streamer = QwenToolCallDeltaStreamer()
 
     # Reasoning budget: when the reasoning phase exceeds the budget, force
     # end-of-reasoning tokens into the output stream so the model answers
@@ -977,15 +981,10 @@ async def _chat_stream_collector(
                         # Fragments were streamed; the client assembles the
                         # calls itself, so only cross-check against the
                         # authoritative parse and close the finish reason.
-                        tool_streamer.verify(full_tool, label)
-                        names = tool_streamer.names
-                        xlogger.info(
-                            f"{label}: streamed {len(names)} tool call"
-                            f"{'' if len(names) == 1 else 's'} ({tool_format}): " + ", ".join(names)
-                        )
+                        tool_streamer.verify(full_tool, request_id)
                     else:
                         generation["delta_tool_calls"] = _parse_tool_calls(
-                            full_tool, tool_format, label, param_types
+                            full_tool, tool_format, label
                         )
                     generation["finish_reason"] = "tool_calls"
                 await gen_queue.put(generation)
@@ -1001,7 +1000,7 @@ async def _chat_stream_collector(
                 generation["logprob_response"] = ChatCompletionLogprobs(content=collected_logprobs)
             generation["reasoning_content"] = full_reasoning
             generation["content"] = full_content if has_content else None
-            generation["tool_calls"] = _parse_tool_calls(full_tool, tool_format, label, param_types)
+            generation["tool_calls"] = _parse_tool_calls(full_tool, tool_format, label)
             if full_tool:
                 generation["finish_reason"] = "tool_calls"
             return generation

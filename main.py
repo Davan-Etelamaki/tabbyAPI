@@ -5,7 +5,6 @@ import os
 
 import argparse
 import asyncio
-import pathlib
 import platform
 import signal
 from loguru import logger
@@ -18,6 +17,7 @@ from common.actions import run_subcommand
 from common.logger import setup_logger, xlogger
 from common.networking import port_bind_error
 from common.optional_dependencies import check_package_version, dependencies
+from common.paths import runtime_path
 from common.signals import signal_handler
 from common.status_display import status_display
 from common.tabby_config import config
@@ -89,7 +89,7 @@ async def entrypoint_async():
     # and load the model
     model_name = config.model.model_name
     if model_name:
-        model_path = pathlib.Path(config.model.model_dir)
+        model_path = runtime_path(config.model.model_dir)
         model_path = model_path / model_name
 
         # TODO: remove model_dump()
@@ -101,7 +101,7 @@ async def entrypoint_async():
 
         # Load loras after loading the model
         if config.lora.loras:
-            lora_dir = pathlib.Path(config.lora.lora_dir)
+            lora_dir = runtime_path(config.lora.lora_dir)
             # TODO: remove model_dump()
             await model.container.load_loras(lora_dir.resolve(), **config.lora.model_dump())
 
@@ -109,7 +109,7 @@ async def entrypoint_async():
     # and load the model
     embedding_model_name = config.embeddings.embedding_model_name
     if embedding_model_name:
-        embedding_model_path = pathlib.Path(config.embeddings.embedding_model_dir)
+        embedding_model_path = runtime_path(config.embeddings.embedding_model_dir)
         embedding_model_path = embedding_model_path / embedding_model_name
 
         try:

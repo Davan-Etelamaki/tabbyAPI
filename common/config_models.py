@@ -10,7 +10,8 @@ from typing import List, Literal, Optional, Union
 
 
 CACHE_SIZES = Literal["FP16", "Q8", "Q6", "Q4"]
-CACHE_TYPE = Union[CACHE_SIZES, constr(pattern=r"^[2-8]\s*,\s*[2-8]$")]
+# NVFP4/FP8 KV cache (fork exllamav3 CacheLayer_nvfp4/CacheLayer_fp8)
+CACHE_TYPE = Union[CACHE_SIZES, Literal["NVFP4", "FP8"], constr(pattern=r"^[2-8]\s*,\s*[2-8]$")]
 
 
 class Metadata(BaseModel):
@@ -745,6 +746,16 @@ class DraftModelConfig(BaseConfigModel):
             "tokens of the earlier continuation in one verification pass (default: 0,\n"
             "off). Works on top of any draft mode, or on its own. Longer values advance\n"
             "more tokens at prefill speed on a hit, and cost a wider verification pass."
+        ),
+        ge=0,
+    )
+    replay_max_tokens: Optional[int] = Field(
+        0,
+        description=(
+            "Verified replay: ceiling for hazard-adaptive widening of the hybrid\n"
+            "lane. After enough fully-accepted hybrid rounds in a row, the copy\n"
+            "window aims past hybrid_draft_tokens toward this many tokens per\n"
+            "verification pass (default: 0, off). Requires hybrid_draft_tokens > 0."
         ),
         ge=0,
     )

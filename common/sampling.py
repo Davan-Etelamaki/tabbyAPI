@@ -7,6 +7,7 @@ from pydantic_core import ValidationError
 from ruamel.yaml import YAML
 from copy import deepcopy
 from common.logger import xlogger
+from common.paths import SAMPLER_OVERRIDES_DIR
 from pydantic import (
     AliasChoices,
     BaseModel,
@@ -82,7 +83,7 @@ class BaseSamplerRequest(BaseModel):
         validation_alias=AliasChoices("max_tokens", "max_completion_tokens", "max_length"),
         description="Aliases: max_length",
         examples=[150],
-        ge=0,
+        ge=1,
     )
 
     min_tokens: Optional[int] = Field(
@@ -631,7 +632,7 @@ def resolve_preset_path(preset_name: str) -> Optional[pathlib.Path]:
     "my_preset" and "my_preset.yml" find the same file.
     """
 
-    override_directory = pathlib.Path("sampler_overrides")
+    override_directory = SAMPLER_OVERRIDES_DIR
     name = preset_name.strip()
 
     candidates = [override_directory / name]
@@ -919,7 +920,7 @@ def _describe_layer(
 def get_all_presets():
     """Fetches all sampler override presets from the overrides directory"""
 
-    override_directory = pathlib.Path("sampler_overrides")
+    override_directory = SAMPLER_OVERRIDES_DIR
     preset_files = [file.stem for file in override_directory.glob("*.yml")]
 
     return preset_files

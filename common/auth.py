@@ -16,9 +16,10 @@ from pydantic import BaseModel, PrivateAttr
 from ruamel.yaml import YAML
 
 from common.logger import xlogger
+from common.paths import APP_ROOT
 from common.utils import coalesce
 
-AUTH_FILE = "api_tokens.yml"
+AUTH_FILE = APP_ROOT / "api_tokens.yml"
 
 # Seconds between checks for changes to the auth file
 AUTH_FILE_POLL_INTERVAL = 2.0
