@@ -931,6 +931,20 @@ class MemoryConfig(BaseConfigModel):
             "Enable this to force the cudaMallocAsync backend instead."
         ),
     )
+    admission_margin_granules: Optional[int] = Field(
+        8,
+        description=(
+            "Free VRAM headroom demanded on top of a request's prompt tier before the\n"
+            "engine starts ingesting that prompt, in 20 MiB granules (default: 8).\n"
+            "Several large prompts ingested at once peak together and can exhaust the\n"
+            "card; with a gate, a request whose tier does not fit this much free memory\n"
+            "waits in the queue instead and starts when memory frees, while a request\n"
+            "that is already generating never waits. Needs an ExLlamaV3 engine built\n"
+            "with the admission gate (earlier engines ignore the key). 0 prices the tier\n"
+            "alone; raise it for more slack."
+        ),
+        ge=0,
+    )
 
 
 class DeveloperConfig(BaseConfigModel):

@@ -1328,6 +1328,7 @@ class ExllamaV3Container:
                 max_batch_size=self.max_batch_size,
                 max_chunk_size=self.chunk_size,
                 recurrent_cache_size=config.memory.sysmem_recurrent_cache * 1024**2,
+                admission_margin_granules=config.memory.admission_margin_granules,
                 cpu_cache_size=config.memory.sysmem_kv_cache * 1024**2,
                 num_draft_tokens=self.draft_num_tokens,
                 dynamic_draft_tokens=self.dynamic_draft,
