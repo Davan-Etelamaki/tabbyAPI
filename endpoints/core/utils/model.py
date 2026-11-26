@@ -347,7 +347,7 @@ LOAD_OPTION_GROUPS = [
             "muse_glimmer",
         ],
     ),
-    ("Sampling and warmup", "model", ["sampling", "warmup"]),
+    ("Sampling and warmup", "model", ["sampling", "use_generation_config", "warmup"]),
     (
         "Draft model",
         "draft_model",

@@ -521,6 +521,17 @@ class ModelConfig(BaseConfigModel):
             "an override is forced."
         ),
     )
+    use_generation_config: Optional[bool] = Field(
+        False,
+        description=(
+            "Take fallback sampling values from the model's generation_config.json "
+            "(default: False).\n"
+            "The temperature, top_k, top_p, min_p and repetition_penalty it sets apply to\n"
+            "requests that omit them, ahead of the global sampling section; parameters\n"
+            "the file doesn't set keep those fallbacks. do_sample: false means greedy\n"
+            "decoding. This model's own sampling section still wins over the file."
+        ),
+    )
     template_vars_default: dict = Field(
         {},
         description=(
@@ -691,7 +702,9 @@ class DraftModelConfig(BaseConfigModel):
         default_factory=list,
         description=(
             "Array of VRAM sizes to split between GPUs, in GB (default: []).\n"
-            "If this isn't filled in, the draft model is autosplit."
+            "If this isn't filled in, the draft model is autosplit.\n"
+            "Ignored for draft models that load alongside their target model\n"
+            "(e.g. Gemma4 assistant drafters), which follow the target's split."
         ),
     )
     draft_num_tokens: Optional[int] = Field(
@@ -792,7 +805,7 @@ class SamplingConfig(BaseConfigModel):
             "This overrides default fallbacks for sampler values "
             "that are passed to the API.\n"
             "NOTE: safe_defaults provides llama.cpp-style fallbacks (temperature 0.8, "
-            "top_k 40, top_p 0.95, min_p 0.05)\n"
+            "top_k 40, top_p 0.95, min_p 0.05, temperature applied last)\n"
             "for frontends that don't send sampling parameters. Leaving this blank "
             "means no fallbacks at all.\n"
             "Individual overrides can also be written directly in this section\n"
