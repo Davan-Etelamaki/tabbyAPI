@@ -2259,7 +2259,6 @@ class ExllamaV3Container:
             "full_text": full_text,
         }
 
-        # TODO: Add extended draft stats in backend
         if accepted_draft_tokens is not None:
             finish_chunk.update(
                 {
@@ -2267,6 +2266,10 @@ class ExllamaV3Container:
                     "draft_reject": rejected_draft_tokens,
                 }
             )
+            # Engine emits draft_depth only when its telemetry gate is on
+            draft_depth = result.get("draft_depth")
+            if draft_depth:
+                finish_chunk["draft_depth"] = draft_depth
 
         return finish_chunk
 
