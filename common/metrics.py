@@ -65,6 +65,10 @@ FIRST_TOKEN_BUCKETS = (
     2560.0,
 )
 
+# Accepted-draft-depth buckets: current served draft widths top out at 8, so
+# the tail buckets catch anything wider without minting a bucket per width.
+DRAFT_DEPTH_BUCKETS = (0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 12.0, 16.0)
+
 
 class _Histogram:
     """A cumulative-bucket histogram for the Prometheus text format."""
@@ -108,6 +112,9 @@ class MetricsManagerClass:
         self.draft_tokens_total = 0
         self.draft_tokens_accepted_total = 0
         self.drafts_total = 0
+        # Per-step accepted-draft distribution, fed by the engine's depth census
+        self.draft_depth = _Histogram(DRAFT_DEPTH_BUCKETS)
+        self.draft_verify_steps = 0
 
         self.queue_time = _Histogram(LATENCY_BUCKETS)
         self.first_token_time = _Histogram(FIRST_TOKEN_BUCKETS)
@@ -147,6 +154,14 @@ class MetricsManagerClass:
             # Every decode step emits one token of the target model's own, with
             # the accepted drafts riding along on top of it
             self.drafts_total += max(gen_tokens - accepted, 0)
+
+        # Engine census (EXL3_DEPTH_TELE=1): exact per-step depth histogram
+        dd = finish.get("draft_depth")
+        if dd:
+            self.draft_verify_steps += dd.get("s", 0)
+            for depth, steps in enumerate(dd.get("a", ())):
+                for _ in range(steps):
+                    self.draft_depth.observe(float(depth))
 
     def _since_last_scrape(self, gauge: str, tokens: float, seconds: float) -> float:
         """Tokens per second since the last scrape, the window llama.cpp's gauges cover."""
@@ -231,6 +246,13 @@ class MetricsManagerClass:
                 "spec_decode_num_drafts_total",
                 "Speculative: Total speculative decoding verification steps",
                 self.drafts_total,
+            ),
+            (
+                "counter",
+                "spec_decode_verify_steps_total",
+                "Speculative: Exact verify-step count from the engine depth census"
+                " (0 until EXL3_DEPTH_TELE=1)",
+                self.draft_verify_steps,
             ),
             (
                 "gauge",
@@ -323,6 +345,12 @@ class MetricsManagerClass:
                 "e2e_request_latency_seconds",
                 "Histogram of end to end request latency, in seconds",
                 self.e2e_latency,
+            ),
+            (
+                "spec_decode_draft_depth_accepted",
+                "Distribution of accepted draft tokens per verify step"
+                " (engine census; empty until EXL3_DEPTH_TELE=1)",
+                self.draft_depth,
             ),
         ]
 
