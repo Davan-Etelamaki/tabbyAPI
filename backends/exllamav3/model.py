@@ -425,6 +425,17 @@ class ExllamaV3Container:
                 f" {'ON' if inkling_attn_graph else 'OFF'} (inkling_attn_graph)."
             )
 
+        # Inkling key-tiled online-softmax prefill arm. Unset defers to the
+        # engine default (off = the current query-tiled body, bit-identical);
+        # on is numerically-equivalent (<=1e-4 abs), not bit-identical
+        inkling_attn_keytile = unwrap(kwargs.get("inkling_attn_keytile"), None)
+        if inkling_attn_keytile is not None:
+            self.config.infer_params.inkling_attn_keytile = inkling_attn_keytile
+            xlogger.info(
+                f"Key-tiled prefill attention set to"
+                f" {'ON' if inkling_attn_keytile else 'OFF'} (inkling_attn_keytile)."
+            )
+
         # Prepare vision model if requested in config
         self.vision_model = None
         self.use_vision = kwargs.get("vision", False)

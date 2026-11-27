@@ -377,6 +377,18 @@ class ModelConfig(BaseConfigModel):
             "to turn the piecewise-capture pilot on for an A/B run."
         ),
     )
+    inkling_attn_keytile: Optional[bool] = Field(
+        None,
+        description=(
+            "Split the KEY axis as well as the query axis in Inkling 2 prefill\n"
+            "attention, folding the running max/sum so no (heads, seq, seq)\n"
+            "fp32 scores plane is ever materialised (default: None → the\n"
+            "engine's off default, the current query-tiled body, bit-identical\n"
+            "to the served path). Set true numerically-equivalent (<=1e-4 abs),\n"
+            "NOT bit-identical — rescaling reorders the exp summation.\n"
+            "Intended for long-context ingest A/B."
+        ),
+    )
     layer_map: Optional[Union[List[int], str]] = Field(
         None,
         description=(
