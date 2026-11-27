@@ -446,6 +446,20 @@ class ModelConfig(BaseConfigModel):
             "long-context ingest A/B on sm_89; no rate is claimed."
         ),
     )
+    inkling_moe_grouped_ext: Optional[bool] = Field(
+        None,
+        description=(
+            "Route Inkling 2 MoE multi-token expert work through the two-launch\n"
+            "grouped kernels (gather + gate/up + softcap-swiglu fused into fp16,\n"
+            "then down + one full-order combine) instead of the eager per-group\n"
+            "python chain (default: None → the engine's off default; served path\n"
+            "bit-identical). The tier serves the fp16-dense expert layout and\n"
+            "refuses this pack's exl3 quant layout with a named reason, keeping the\n"
+            "eager chain by refusal, never wrong math; the t == 1 decode and capture\n"
+            "seams keep the host round verbatim. Intended for dispatch A/B on sm_89;\n"
+            "no rate is claimed."
+        ),
+    )
     layer_map: Optional[Union[List[int], str]] = Field(
         None,
         description=(

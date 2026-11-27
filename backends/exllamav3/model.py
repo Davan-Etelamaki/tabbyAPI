@@ -496,6 +496,14 @@ class ExllamaV3Container:
                 f" {'ON' if inkling_attn_flashprefill else 'OFF'} (inkling_attn_flashprefill)."
             )
 
+        inkling_moe_grouped_ext = unwrap(kwargs.get("inkling_moe_grouped_ext"), None)
+        if inkling_moe_grouped_ext is not None:
+            self.config.infer_params.inkling_moe_grouped_ext = inkling_moe_grouped_ext
+            xlogger.info(
+                f"MoE grouped expert tier set to"
+                f" {'ON' if inkling_moe_grouped_ext else 'OFF'} (inkling_moe_grouped_ext)."
+            )
+
         # Prepare vision model if requested in config
         self.vision_model = None
         self.use_vision = kwargs.get("vision", False)
