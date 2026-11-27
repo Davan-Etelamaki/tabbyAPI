@@ -436,6 +436,35 @@ class ExllamaV3Container:
                 f" {'ON' if inkling_attn_keytile else 'OFF'} (inkling_attn_keytile)."
             )
 
+        # Inkling bias-fused prefill attention arm. Unset defers to the engine
+        # default (off = the served body, bit-identical); on folds the bias
+        # band and the softmax epilogue into the block-sized scores plane and
+        # is numerically-equivalent (<=1e-4 abs), not bit-identical
+        inkling_attn_biasfuse = unwrap(kwargs.get("inkling_attn_biasfuse"), None)
+        if inkling_attn_biasfuse is not None:
+            self.config.infer_params.inkling_attn_biasfuse = inkling_attn_biasfuse
+            xlogger.info(
+                f"Bias-fused prefill attention set to"
+                f" {'ON' if inkling_attn_biasfuse else 'OFF'} (inkling_attn_biasfuse)."
+            )
+
+        # Routed-expert weight-residence ledger for the Inkling 2 MoE block.
+        # Unset defers to the engine default (off = the ledger is never
+        # entered, bit-identical); on censuses which device each routed
+        # expert's weights sit on and logs INKLING-MOE-EXPERTX periodically
+        inkling_moe_expert_residency_ledger = unwrap(
+            kwargs.get("inkling_moe_expert_residency_ledger"), None
+        )
+        if inkling_moe_expert_residency_ledger is not None:
+            self.config.infer_params.inkling_moe_expert_residency_ledger = (
+                inkling_moe_expert_residency_ledger
+            )
+            xlogger.info(
+                f"Routed-expert residence ledger set to"
+                f" {'ON' if inkling_moe_expert_residency_ledger else 'OFF'}"
+                f" (inkling_moe_expert_residency_ledger)."
+            )
+
         # Prepare vision model if requested in config
         self.vision_model = None
         self.use_vision = kwargs.get("vision", False)

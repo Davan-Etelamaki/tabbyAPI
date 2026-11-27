@@ -389,6 +389,32 @@ class ModelConfig(BaseConfigModel):
             "Intended for long-context ingest A/B."
         ),
     )
+    inkling_attn_biasfuse: Optional[bool] = Field(
+        None,
+        description=(
+            "Fold the relative-bias gather and the mask/exp/max/sum softmax\n"
+            "epilogue into the block-sized scores plane of Inkling 2 global\n"
+            "attention, so no (heads, tile, seq) bias plane and no full scores\n"
+            "plane are materialised (default: None → the engine's off default,\n"
+            "the served body, bit-identical to the served path). Set true is\n"
+            "numerically-equivalent (<=1e-4 abs), NOT bit-identical — rescaling\n"
+            "reorders the exp summation. The arm falls back to the served body\n"
+            "when the byte budget leaves no room to fuse. Intended for\n"
+            "long-context ingest A/B."
+        ),
+    )
+    inkling_moe_expert_residency_ledger: Optional[bool] = Field(
+        None,
+        description=(
+            "Census the routed experts' weight residence in the Inkling 2 MoE\n"
+            "block and log INKLING-MOE-EXPERTX periodically: which device each\n"
+            "expert's trellis/suh/svh tensors sit on, and whether their\n"
+            "addresses moved without an unload (default: None → the engine's off\n"
+            "default, the ledger is never entered and the block stays\n"
+            "bit-identical to the served path). Diagnostic only: it sizes the\n"
+            "overlap a routed-expert prefetch would have to hide."
+        ),
+    )
     layer_map: Optional[Union[List[int], str]] = Field(
         None,
         description=(
