@@ -41,6 +41,33 @@ CODE_FENCE_END_RE = re.compile(r"\s*```\s*$", re.MULTILINE)
 ParamTypes = dict[str, dict[str, Optional[str]]]
 
 
+def tool_names_from_tools(tools) -> Optional[list]:
+    """
+    Request-declared tool names - the authority for what may stream, paired
+    with param_types_from_tools. ToolSpec objects or the equivalent dicts are
+    both accepted, mirroring param_types_from_tools' shape handling. Returns
+    None when nothing is declared, which leaves the streamer's name filter
+    inactive (no list to filter against).
+    """
+
+    if not tools:
+        return None
+    names: list = []
+    for tool in tools:
+        function = getattr(tool, "function", None)
+        if function is None and isinstance(tool, dict):
+            function = tool.get("function")
+        if function is None:
+            continue
+        if isinstance(function, dict):
+            name = function.get("name")
+        else:
+            name = getattr(function, "name", None)
+        if name:
+            names.append(name)
+    return names or None
+
+
 def param_types_from_tools(tools) -> ParamTypes:
     """
     Declared parameter types per function from the request's tool definitions

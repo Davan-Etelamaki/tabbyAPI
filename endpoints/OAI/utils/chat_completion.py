@@ -54,7 +54,10 @@ from endpoints.OAI.utils.tools import (
     supports_delta_streaming,
 )
 from endpoints.OAI.utils.toolcall_stream import QwenToolCallDeltaStreamer
-from endpoints.OAI.utils.toolcall_formats.common import param_types_from_tools
+from endpoints.OAI.utils.toolcall_formats.common import (
+    param_types_from_tools,
+    tool_names_from_tools,
+)
 from endpoints.OAI.utils.common_ import aggregate_usage_stats, get_timings, get_usage_stats
 
 
@@ -849,7 +852,9 @@ async def _chat_stream_collector(
     param_types = param_types_from_tools(params.tools) if use_tool else None
     tool_streamer = None
     if streaming_mode and use_tool and supports_delta_streaming(tool_format):
-        tool_streamer = QwenToolCallDeltaStreamer(param_types)
+        tool_streamer = QwenToolCallDeltaStreamer(
+            param_types, tool_names_from_tools(params.tools)
+        )
 
     # Reasoning budget: when the reasoning phase exceeds the budget, force
     # end-of-reasoning tokens into the output stream so the model answers
