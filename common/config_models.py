@@ -732,10 +732,11 @@ class DraftModelConfig(BaseConfigModel):
         lt=1,
     )
     ngram_match_min: Optional[int] = Field(
-        2,
+        None,
         description=(
-            "Minimum match length for exllamav3 n-gram drafting (default: 2).\n"
-            "Only used when draft_mode is ngram."
+            "Minimum match length for exllamav3 n-gram drafting (default: auto - 2 when draft_mode is ngram, 0 otherwise).\n"
+            "Unset is resolved by the container; a non-null default here would "
+            "leak into every draft mode since the field is always present post-validation."
         ),
     )
     hybrid_draft_tokens: Optional[int] = Field(
