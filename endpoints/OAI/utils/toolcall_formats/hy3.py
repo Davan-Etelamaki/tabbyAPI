@@ -3,7 +3,7 @@ import json
 from itertools import zip_longest
 from common.logger import xlogger
 from endpoints.OAI.types.tools import ToolCall, Tool
-from endpoints.OAI.utils.toolcall_formats.common import FormatSignature, coerce_param_value
+from endpoints.OAI.utils.toolcall_formats.common import FormatSignature, unframed_param_value
 
 """
 Hy3 (Tencent Hunyuan) - tokenized XML with interleaved key/value pairs
@@ -30,10 +30,14 @@ rendered as JSON.
 TOOLCALL_START = "<tool_calls:opensource>"
 TOOLCALL_END = "</tool_calls:opensource>"
 
+# Hy4 (Flash) writes the same calls without <tool_sep:opensource>, which the
+# name pattern below allows for. Its template builds every tag from the suffix,
+# '<tool_calls{}>'.format(HYTK) with HYTK = ':opensource', so the full tag never
+# appears literally there
 DETECT = FormatSignature(
-    template_markers=("<tool_calls:opensource>",),
+    template_markers=(("<tool_calls:opensource>", "<tool_calls{}>"), ":opensource"),
     special_tokens=("<tool_calls:opensource>", "<arg_key:opensource>"),
-    architectures=("HunYuan", "Hunyuan"),
+    architectures=("HunYuan", "Hunyuan", "HYV4"),
     reasoning_tags=("<think:opensource>", "</think:opensource>"),
 )
 
@@ -60,12 +64,12 @@ def parse_toolcalls(text: str, param_types=None) -> list[ToolCall]:
 
         # Extract interleaved key/value pairs
         keys = [m.group(1).strip() for m in _ARG_KEY.finditer(inner)]
-        values = [m.group(1).strip() for m in _ARG_VALUE.finditer(inner)]
+        values = [m.group(1) for m in _ARG_VALUE.finditer(inner)]
 
         declared = (param_types or {}).get(func_name, {})
         args: dict[str, any] = {}
         for key, val in zip_longest(keys, values):
-            args[key] = coerce_param_value(val, declared.get(key))
+            args[key] = unframed_param_value(val, declared.get(key))
 
         args_json = json.dumps(args, ensure_ascii=False)
         results.append(ToolCall(function=Tool(name=func_name, arguments=args_json)))

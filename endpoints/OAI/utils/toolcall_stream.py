@@ -16,11 +16,25 @@ delta fragments:
   - when a parameter closes: {index, function: {arguments: <json fragment>}}
   - when the function closes: {index, function: {arguments: "}"}}
 
-String parameter values are additionally streamed while they are generated
-(as a JSON string), as soon as it is provable that the value cannot parse as
-a JSON literal (see _is_streamable). Values that coerce_param_value() may
-convert (objects, arrays, numbers, booleans, null, quoted strings) are
-emitted whole when their parameter closes.
+    - when a call opens: {index, id, type, function: {name, arguments: "{"}}
+    - as a parameter's value is streamed or closes: {index, function: {arguments: <fragment>}}
+    - when the call closes: {index, function: {arguments: "}"}}
+
+  Whether a value can be streamed as it arrives depends on its type, because
+  "123" and 123 are different JSON. The request's tool schema decides: a
+  parameter declared `string` streams from its first character; a parameter
+  with another declared type is emitted whole when it closes, as the value
+  coerce_param_value() parses; a parameter the schema doesn't type falls back
+  to type guessing and is held until the accumulated text provably cannot be a
+  JSON literal (see _is_streamable). Declared strings keep whitespace beyond
+  the template's framing newlines. Untyped values keep the parser's existing
+  whitespace trimming.
+
+  QwenToolCallDeltaStreamer is the tokenizer for the qwen3_coder pseudo-XML
+  (<function=NAME> ... <parameter=KEY>VALUE</parameter> ... </function>),
+  consuming TOOL-channel text as TagStreamParser produces it (the format's own
+  wrapper tags included) and driving the emitter. Other formats register their
+  tokenizer in DELTA_STREAMERS.
 
 Guarantee: for well-formed calls, the concatenation of all "arguments"
 fragments per index is byte-identical to the arguments string produced by
@@ -45,6 +59,7 @@ from uuid import uuid4
 from common.logger import xlogger
 from endpoints.OAI.utils.toolcall_formats import qwen3_coder
 from endpoints.OAI.utils.toolcall_formats.common import coerce_param_value
+from endpoints.OAI.utils.tools import canonical_format_name
 
 _FUNC_OPEN = re.compile(r"<function=([^>\s]+)[^>]*>")
 _PARAM_OPEN = re.compile(r"<parameter=([^>\s]+)[^>]*>")
@@ -99,8 +114,14 @@ class QwenToolCallDeltaStreamer:
     _OUT = 0
     _VALUE = 1
 
-    def __init__(self, valid_names=None):
+    def __init__(self, param_types=None, valid_names=None):
         self._valid = set(valid_names) if valid_names is not None else None
+        # Request-declared parameter types ({function: {param: kind}}); the schema
+        # decides streaming for declared parameters, everything else keeps the
+        # provably-not-a-JSON-literal rule (upstream param_types semantics grafted
+        # onto the boundary-scan streamer).
+        self.param_types = param_types or {}
+        self._declared: Optional[str] = None
         self.emitted = False
         self._unsafe = False
         self._released = False
@@ -306,6 +327,9 @@ class QwenToolCallDeltaStreamer:
                 continue
             else:
                 self._param_key = name.strip()
+                self._declared = self.param_types.get(
+                    self._names[self._index], {}
+                ).get(self._param_key)
                 if self._param_key in self._keys:
                     # The end-of-stream parser keeps the last occurrence; the
                     # duplicate key we stream still parses to the same dict.
@@ -324,6 +348,27 @@ class QwenToolCallDeltaStreamer:
 
     # -- value handling
 
+    def _stream_candidate(self) -> str:
+        """The emittable prefix of the raw value under this parameter's schema.
+
+        A declared string streams from its first content character and keeps
+        whitespace the end-of-stream reading keeps (strip_parameter_delimiters
+        trims only the template's framing newlines); trailing newlines stay
+        held because only at close can one be told apart from the framing one.
+        A non-string declared type never streams - its value must not be
+        mistaken for a JSON string mid-parse - and is emitted whole at close.
+        Undeclared parameters keep the provably-not-a-JSON-literal rule.
+        """
+        if self._declared == "string":
+            base = self._raw.removeprefix("\n")
+            while base.endswith("\n"):
+                base = base[:-1]
+            return base
+        if self._declared is not None:
+            return ""
+        stripped = self._raw.strip()
+        return stripped if stripped and _is_streamable(stripped) else ""
+
     def _consume_value(self, text: str, deltas: list):
         if not text:
             return
@@ -331,42 +376,54 @@ class QwenToolCallDeltaStreamer:
         self._raw += text
 
         if not self._streaming:
-            stripped = self._raw.strip()
-            if stripped and _is_streamable(stripped):
+            candidate = self._stream_candidate()
+            if candidate:
                 self._streaming = True
-                self._sent = stripped
-                self._emit(deltas, self._arg_fragment(self._param_prefix() + '"' + _esc(stripped)))
+                self._sent = candidate
+                self._emit(deltas, self._arg_fragment(self._param_prefix() + '"' + _esc(candidate)))
             return
 
-        # Streaming: the stripped prefix of the raw value grows monotonically;
-        # trailing whitespace stays unemitted until later text makes it
-        # interior, matching the strip() applied by the end-of-stream parser.
-        candidate = self._raw.strip()
+        # Streaming: the candidate prefix of the raw value grows monotonically;
+        # trailing whitespace/newlines stay unemitted until later text makes them
+        # interior, matching the value the end-of-stream parser will produce.
+        candidate = self._stream_candidate()
         new = candidate[len(self._sent) :]
         if new:
             self._sent = candidate
             self._emit(deltas, self._arg_fragment(_esc(new)))
 
     def _close_param(self, deltas: list):
+        declared = self._declared
         if self._streaming:
-            # Close the JSON string. The streamed content must equal the
-            # stripped raw value; guard against any drift.
-            final = json.dumps(self._raw.strip(), ensure_ascii=False)
-            streamed = '"' + _esc(self._sent) + '"'
-            if final != streamed:
+            # Close the JSON string. The streamed content must be a prefix of
+            # the final value; the unemitted tail (held trailing whitespace or
+            # framing-newline ambiguity) is appended here, never retracted.
+            final_text = (
+                qwen3_coder.strip_parameter_delimiters(self._raw)
+                if declared == "string"
+                else self._raw.strip()
+            )
+            if final_text.startswith(self._sent):
+                tail = final_text[len(self._sent) :]
+                self._emit(deltas, self._arg_fragment(_esc(tail) + '"'))
+            else:
                 xlogger.error(
                     "Tool-call delta stream diverged from value at parameter close",
                     {"function": self._names[self._index], "key": self._param_key},
                 )
-            self._emit(deltas, self._arg_fragment('"'))
+                self._emit(deltas, self._arg_fragment('"'))
         else:
-            value = coerce_param_value(self._raw)
+            if declared == "string":
+                value = qwen3_coder.strip_parameter_delimiters(self._raw)
+            else:
+                value = coerce_param_value(self._raw, declared)
             self._emit(
                 deltas,
                 self._arg_fragment(self._param_prefix() + json.dumps(value, ensure_ascii=False)),
             )
 
         self._param_key = None
+        self._declared = None
         self._raw = ""
         self._streaming = False
         self._sent = ""
@@ -384,7 +441,7 @@ class QwenToolCallDeltaStreamer:
         """
 
         try:
-            theirs = qwen3_coder.parse_toolcalls(self._block_raw)
+            theirs = qwen3_coder.parse_toolcalls(self._block_raw, self.param_types)
             ok = (
                 len(theirs) == 1
                 and theirs[0].function.name == self._names[idx]
@@ -429,7 +486,7 @@ class QwenToolCallDeltaStreamer:
         """
 
         try:
-            authoritative = qwen3_coder.parse_toolcalls(full_tool)
+            authoritative = qwen3_coder.parse_toolcalls(full_tool, self.param_types)
             # strict=False: a length mismatch here is itself a divergence,
             # and is reported by the comparison below rather than raised here
             mine = list(zip(self._names, self._assembled, strict=False))
@@ -465,3 +522,16 @@ class QwenToolCallDeltaStreamer:
                 )
         except Exception as exc:  # never fail the stream on verification
             xlogger.debug(f"Tool-call delta verification skipped: {exc}")
+
+
+# Formats with an incremental streamer, by canonical format name
+DELTA_STREAMERS = {
+    "qwen3_coder": QwenToolCallDeltaStreamer,
+}
+
+
+def make_delta_streamer(tool_format: Optional[str], param_types: Optional[dict] = None):
+    """The delta streamer for a format, or None when the format has none."""
+
+    cls = DELTA_STREAMERS.get(canonical_format_name(tool_format)) if tool_format else None
+    return cls(param_types=param_types) if cls else None

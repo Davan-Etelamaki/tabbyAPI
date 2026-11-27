@@ -54,6 +54,7 @@ from endpoints.OAI.utils.tools import (
     supports_delta_streaming,
 )
 from endpoints.OAI.utils.toolcall_stream import QwenToolCallDeltaStreamer
+from endpoints.OAI.utils.toolcall_formats.common import param_types_from_tools
 from endpoints.OAI.utils.common_ import aggregate_usage_stats, get_timings, get_usage_stats
 
 
@@ -705,6 +706,7 @@ def _parse_tool_calls(
     text: str,
     tool_format: str,
     label: str,
+    param_types: dict | None = None,
 ) -> list:
     """
     Parse collected tool calls and convert to OAI format.
@@ -714,7 +716,7 @@ def _parse_tool_calls(
     deltas, which we don't do here.)
     """
 
-    parsed = parse_toolcalls(text, tool_format)
+    parsed = parse_toolcalls(text, tool_format, param_types)
     for tc_idx, p in enumerate(parsed):
         p.index = tc_idx
     dumped = [p.model_dump(mode="json") for p in parsed]
@@ -842,9 +844,12 @@ async def _chat_stream_collector(
     # OpenAI-style tool call fragments as they are generated instead of one
     # complete delta at end of stream. The end-of-stream parse stays as the
     # fallback whenever the streamer produced nothing.
+    # Parameter types declared by the request's tool schemas: the authority for
+# value coercion in the end-of-stream parse and for streaming decisions.
+    param_types = param_types_from_tools(params.tools) if use_tool else None
     tool_streamer = None
     if streaming_mode and use_tool and supports_delta_streaming(tool_format):
-        tool_streamer = QwenToolCallDeltaStreamer()
+        tool_streamer = QwenToolCallDeltaStreamer(param_types)
 
     # Reasoning budget: when the reasoning phase exceeds the budget, force
     # end-of-reasoning tokens into the output stream so the model answers
@@ -984,7 +989,7 @@ async def _chat_stream_collector(
                         tool_streamer.verify(full_tool, request_id)
                     else:
                         generation["delta_tool_calls"] = _parse_tool_calls(
-                            full_tool, tool_format, label
+                            full_tool, tool_format, label, param_types
                         )
                     generation["finish_reason"] = "tool_calls"
                 await gen_queue.put(generation)
@@ -1000,7 +1005,7 @@ async def _chat_stream_collector(
                 generation["logprob_response"] = ChatCompletionLogprobs(content=collected_logprobs)
             generation["reasoning_content"] = full_reasoning
             generation["content"] = full_content if has_content else None
-            generation["tool_calls"] = _parse_tool_calls(full_tool, tool_format, label)
+            generation["tool_calls"] = _parse_tool_calls(full_tool, tool_format, label, param_types)
             if full_tool:
                 generation["finish_reason"] = "tool_calls"
             return generation

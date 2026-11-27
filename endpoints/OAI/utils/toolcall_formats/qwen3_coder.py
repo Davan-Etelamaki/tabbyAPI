@@ -172,7 +172,12 @@ def _scan(text, open_re, close_tag, legal):
         pos = next_pos
 
 
-def parse_toolcalls(text: str) -> list[ToolCall]:
+def strip_parameter_delimiters(value: str) -> str:
+    """Remove the single newline on each side of a value in the Qwen template."""
+    return value.removeprefix("\n").removesuffix("\n")
+
+
+def parse_toolcalls(text: str, param_types=None) -> list[ToolCall]:
     # If there are outer <tool_call> wrappers, unwrap them; otherwise use the whole text
     segments: list[str] = []  # inner text of each tool-call block
     wrapped = list(_scan(text, _CALL_OPEN_SCAN, CALL_CLOSE, None))
@@ -189,10 +194,23 @@ def parse_toolcalls(text: str) -> list[ToolCall]:
     for inner in segments:
         for func_name, func_body in _scan(inner, _FUNC_OPEN_SCAN, FUNC_CLOSE, None):
             args: dict[str, any] = {}
+            declared = (param_types or {}).get(func_name, {})
             for key, raw_value in _scan(
                 func_body, _PARAM_OPEN_SCAN, PARAM_CLOSE, _AFTER_PARAM_CLOSE
             ):
-                args[key.strip()] = coerce_param_value(raw_value.strip())
+                # Boundary detection stays ours (literal markup inside values,
+                # nesting); value semantics follow the request schema the way
+                # upstream defines it: a declared string keeps everything but the
+                # template's framing newlines, any other declared type coerces
+                # with the schema as authority, undeclared keeps the JSON guess.
+                key = key.strip()
+                kind = declared.get(key)
+                if kind == "string":
+                    args[key] = strip_parameter_delimiters(raw_value)
+                elif kind is not None:
+                    args[key] = coerce_param_value(raw_value, kind)
+                else:
+                    args[key] = coerce_param_value(raw_value.strip())
 
             args_json = json.dumps(args, ensure_ascii=False)
             results.append(ToolCall(function=Tool(name=func_name, arguments=args_json)))
