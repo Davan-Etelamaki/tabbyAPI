@@ -429,6 +429,23 @@ class ModelConfig(BaseConfigModel):
             "Intended for decode-latency A/B on sm_89; no throughput is claimed."
         ),
     )
+    inkling_attn_flashprefill: Optional[bool] = Field(
+        None,
+        description=(
+            "Run Inkling 2 global prefill attention through a hand-written sm_89\n"
+            "flash-style kernel: the whole softmax lives in tensor-core accumulators\n"
+            "and registers, so no (kvh, rows, cols) fp32 scores plane reaches memory\n"
+            "per key block, and the relative-bias band is folded inside the kernel's\n"
+            "key-tile loop (default: None → the engine's off default, the seam never\n"
+            "resolves the kernel and the served path is bit-identical). Set true is\n"
+            "equivalent, NOT bit-identical — the accumulation order differs from\n"
+            "torch's, so the engine gates it with a once-per-layer bounded-diff audit\n"
+            "against the fused path (INKLING-FLASHAUDIT) and takes the arm out of\n"
+            "service above its bound. Geometry or budget the plan cannot honour prints\n"
+            "INKLING-FLASHDECLINE and falls back to the fused path. Intended for\n"
+            "long-context ingest A/B on sm_89; no rate is claimed."
+        ),
+    )
     layer_map: Optional[Union[List[int], str]] = Field(
         None,
         description=(

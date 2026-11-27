@@ -480,6 +480,22 @@ class ExllamaV3Container:
                 f" {'ON' if inkling_attn_l2win else 'OFF'} (inkling_attn_l2win)."
             )
 
+        # Inkling sm_89 flash-prefill attention arm. Unset defers to the engine
+        # default (off = the seam never resolves the kernel, bit-identical); on
+        # keeps the whole softmax in tensor-core accumulators and registers, so no
+        # (kvh, rows, cols) scores plane reaches memory per key block, and folds the
+        # relative-bias band inside the kernel's key-tile loop. Equivalent, not
+        # bit-identical: the engine gates it with a once-per-layer bounded-diff
+        # audit against the fused path (INKLING-FLASHAUDIT), and a geometry or
+        # budget it cannot honour prints INKLING-FLASHDECLINE and falls back.
+        inkling_attn_flashprefill = unwrap(kwargs.get("inkling_attn_flashprefill"), None)
+        if inkling_attn_flashprefill is not None:
+            self.config.infer_params.inkling_attn_flashprefill = inkling_attn_flashprefill
+            xlogger.info(
+                f"Flash-prefill attention set to"
+                f" {'ON' if inkling_attn_flashprefill else 'OFF'} (inkling_attn_flashprefill)."
+            )
+
         # Prepare vision model if requested in config
         self.vision_model = None
         self.use_vision = kwargs.get("vision", False)
