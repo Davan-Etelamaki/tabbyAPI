@@ -367,6 +367,16 @@ class ModelConfig(BaseConfigModel):
             "unset, defers to the EXL3_MOE_PINNED_ARENA environment variable."
         ),
     )
+    inkling_attn_graph: Optional[bool] = Field(
+        None,
+        description=(
+            "Replay the Inkling sliding-window attention body at decode from a\n"
+            "captured CUDA graph (default: None → the engine's off default).\n"
+            "The eager python loop stays the control arm, bit-identical to the\n"
+            "served path; a failed capture falls back to it silently. Set true\n"
+            "to turn the piecewise-capture pilot on for an A/B run."
+        ),
+    )
     layer_map: Optional[Union[List[int], str]] = Field(
         None,
         description=(

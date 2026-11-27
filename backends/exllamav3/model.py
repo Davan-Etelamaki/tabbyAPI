@@ -414,6 +414,17 @@ class ExllamaV3Container:
             self.config.infer_params.embed_stream_from_disk = True
             xlogger.info("Streaming token embeddings from disk (embed_stream_from_disk).")
 
+        # Inkling sliding-decode CUDA-graph capture pilot. Unset defers to the
+        # engine default (off = eager control arm, bit-identical); a failed
+        # capture falls back to that arm on the engine side regardless
+        inkling_attn_graph = unwrap(kwargs.get("inkling_attn_graph"), None)
+        if inkling_attn_graph is not None:
+            self.config.infer_params.inkling_attn_graph = inkling_attn_graph
+            xlogger.info(
+                f"Sliding-attention graph capture set to"
+                f" {'ON' if inkling_attn_graph else 'OFF'} (inkling_attn_graph)."
+            )
+
         # Prepare vision model if requested in config
         self.vision_model = None
         self.use_vision = kwargs.get("vision", False)
