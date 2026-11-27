@@ -415,6 +415,20 @@ class ModelConfig(BaseConfigModel):
             "overlap a routed-expert prefetch would have to hide."
         ),
     )
+    inkling_attn_l2win: Optional[bool] = Field(
+        None,
+        description=(
+            "Carve a slice of the GPU's L2 (cudaDeviceSetLimit, once per device)\n"
+            "and steer the Inkling 2 attention stream's decode row span onto it\n"
+            "with hitProp=Persisting and missProp=Streaming, so routed-expert\n"
+            "weight reads evict their own lines instead of the rows a decode step\n"
+            "revisits (default: None → the engine's off default: the policy is\n"
+            "never armed, neither CUDA call is issued, and the served path is\n"
+            "byte-for-byte unchanged). It is a hint: a card or range that cannot\n"
+            "honour it prints INKLING-L2WIN DECLINED and runs with ordinary L2.\n"
+            "Intended for decode-latency A/B on sm_89; no throughput is claimed."
+        ),
+    )
     layer_map: Optional[Union[List[int], str]] = Field(
         None,
         description=(

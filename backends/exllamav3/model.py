@@ -465,6 +465,21 @@ class ExllamaV3Container:
                 f" (inkling_moe_expert_residency_ledger)."
             )
 
+        # Persisting-L2 window over the Inkling 2 decode row span.
+        # Unset defers to the engine default (off = the policy is never armed:
+        # neither cudaDeviceSetLimit nor cudaStreamSetAttribute is issued and no
+        # device attribute is queried, so the served path stays byte-identical).
+        # On carves a slice of L2 and steers the attention stream's row span onto
+        # it with everything else evict-first; a card or address range that cannot
+        # honour it logs INKLING-L2WIN DECLINED and keeps ordinary L2 behaviour.
+        inkling_attn_l2win = unwrap(kwargs.get("inkling_attn_l2win"), None)
+        if inkling_attn_l2win is not None:
+            self.config.infer_params.inkling_attn_l2win = inkling_attn_l2win
+            xlogger.info(
+                f"Persisting-L2 window set to"
+                f" {'ON' if inkling_attn_l2win else 'OFF'} (inkling_attn_l2win)."
+            )
+
         # Prepare vision model if requested in config
         self.vision_model = None
         self.use_vision = kwargs.get("vision", False)
